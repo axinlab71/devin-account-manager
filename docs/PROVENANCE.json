@@ -6,7 +6,7 @@
       "source": "src-tauri/src/modules/windsurf_oauth.rs",
       "target": "src-tauri/src/modules/windsurf_oauth.rs",
       "source_sha256": "924a89a97450f650415022c7f109b6b4ed534e6dd238db16633d58bea82a2ebc",
-      "final_sha256": "e3964422be6708591bd1172e17b55605e89fc7263755fe5cc38744c9e71473d2",
+      "final_sha256": "7b72d9013aa0ed0fb536d83de29a5a68f30d369e01f946829858f9163c7ddf94",
       "modified": true
     },
     {
@@ -108,21 +108,28 @@
       "modified": true
     },
     {
-      "source": "src/types/windsurf.ts",
-      "target": "src/types/windsurf.ts",
-      "source_sha256": "9759521624a5c20cd5cbeea642831e522d754379803b52aeff498ad6ab96d1b2",
-      "final_sha256": "43696bbfdb05a5859e5930c0bf6a056dac0776b4be84dfa4548927e3a0ca07a7",
-      "modified": true
-    },
-    {
       "source": "README.md",
       "target": "docs/UPSTREAM-README.md",
       "source_sha256": "7b9dd2e44b3b15125e25e4e0abe25de2503c987e48ecb8c1bba8599a34faf594",
       "final_sha256": "7b9dd2e44b3b15125e25e4e0abe25de2503c987e48ecb8c1bba8599a34faf594",
       "modified": false
+    },
+    {
+      "source": "src/types/windsurf.ts",
+      "target": "src/types/windsurf.ts",
+      "source_sha256": "9759521624a5c20cd5cbeea642831e522d754379803b52aeff498ad6ab96d1b2",
+      "final_sha256": "a475a41a73c10487692a4c2f16267b503100256711ba9922060a0456b5610b2e",
+      "modified": true
+    },
+    {
+      "source": "src/utils/dataExtract.ts",
+      "target": "src/utils/dataExtract.ts",
+      "source_sha256": "c6409a08c54c6dfd28e5a0feba958ca83134097088671fe7049603cd64aee4e5",
+      "final_sha256": "19bdba1160d906e42e0af1558679e2c1c14e2206ec9337596896f6e3e6e099e7",
+      "modified": true
     }
   ],
-  "derivative_version": "0.1.5",
+  "derivative_version": "0.2.0",
   "new_auth_module": {
     "path": "src-tauri/src/modules/official_browser_login.rs",
     "sha256": "002a255e09ab56d04c55358667fa77f02ca51a5f9384059db0ba564141d9c9b8",

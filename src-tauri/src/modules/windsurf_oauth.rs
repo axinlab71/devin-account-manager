@@ -463,18 +463,18 @@ fn oauth_success_html() -> &'static str {
 <body>
   <div class="box">
     <h1>已收到授权结果</h1>
-    <p>请返回 Devin Switcher 查看凭据验证和账号保存结果。</p>
+    <p>请返回 Devin Account Manager 查看凭据验证和账号保存结果。</p>
   </div>
 <script>history.replaceState(null,'','/auth');</script></body>
 </html>"#
 }
 
 fn fragment_bridge_html() -> &'static str {
-    r#"<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Devin Switcher 网页授权</title><p id="status">等待授权结果，请勿关闭切号器。</p><script>
+    r#"<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Devin Account Manager 网页授权</title><p id="status">等待授权结果，请勿关闭切号器。</p><script>
 const p=new URLSearchParams(location.hash.slice(1));
 history.replaceState(null,'','/auth');
 if(p.has('state')&&(p.has('access_token')||p.has('devin_code')||p.has('error'))){
-fetch('/auth',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString(),credentials:'omit',cache:'no-store'}).then(async r=>{document.getElementById('status').textContent=r.ok?'已收到授权结果，请返回 Devin Switcher 查看账号保存结果。':'回调校验失败，请重新发起授权。';}).catch(()=>{document.getElementById('status').textContent='无法连接切号器，请重新发起授权。';});
+fetch('/auth',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString(),credentials:'omit',cache:'no-store'}).then(async r=>{document.getElementById('status').textContent=r.ok?'已收到授权结果，请返回 Devin Account Manager 查看账号保存结果。':'回调校验失败，请重新发起授权。';}).catch(()=>{document.getElementById('status').textContent='无法连接切号器，请重新发起授权。';});
 }</script></html>"#
 }
 

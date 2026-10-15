@@ -25,3 +25,5 @@ See `docs/PROVENANCE.json` for source paths and hashes before modification. Shar
 0.1.4：参考用户提供的本机 Devin Desktop 主题和界面资源调整布局与配色。应用图标来自 E:/Devin/resources/app/resources/win32/code.ico；来源与哈希见 docs/DESIGN-REFERENCE.json。Devin 名称、图标及相关品牌资产属于其各自权利人，不因本项目代码的 CC BY-NC-SA 4.0 许可而改变其权属。本应用为独立衍生工具，不表示官方出品或背书。
 
 0.1.5：新增认证传输层，在连接建立失败时单次直连尝试，保留上游请求载荷、认证端点与 User-Agent；添加脱敏错误类别和网络回归测试。
+
+0.2.0：产品更名为 Devin Account Manager，兼容原存储与应用标识；复用上游 src/types/windsurf.ts 和 src/utils/dataExtract.ts，修正缺失额度处理及二进制快照已用/剩余方向，新增额度展示与回归测试，精简布局和限时成功提示。

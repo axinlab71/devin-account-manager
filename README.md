@@ -1,4 +1,4 @@
-# Devin Switcher
+# Devin Account Manager · Devin 账户管理器
 
 <img src="public/devin.png" width="48" alt="Devin icon"/>
 
@@ -6,11 +6,11 @@
 
 [下载最新版本](https://github.com/sxxxxxxxxxxxxxxxxxxxxx/devin-switcher/releases/latest) · [上游 Cockpit Tools](https://github.com/jlcodes99/cockpit-tools) · [许可与署名](NOTICE.md)
 
-![账号列表（合成演示数据）](docs/ui-0.1.4-dark-list.png)
+![账号列表（合成演示数据）](docs/ui-0.2.0-dark-list.png)
 
 从 [Cockpit Tools](https://github.com/jlcodes99/cockpit-tools) 提取的精简 Devin Desktop 账号管理应用。核心账号、导入、刷新和客户端会话注入代码来自原项目，并非重新实现一套上号协议。
 
-## 使用（0.1.5）
+## 使用（0.2.0）
 
 1. 打开切号器，点击“添加账号 → 网页授权 → 开始网页授权”。
 2. 在系统浏览器完成目标账号登录。
@@ -29,6 +29,17 @@
 没有注册或接管 `devin://`，没有修改服务端允许列表，也没有伪造新的 client_id。授权凭据不写入 pending 文件、不出现在日志中；保存的账号详情仍使用原有加密格式。
 
 **当前验证范围：**0.1.2 发布后，用户反馈网页授权“好像这次确实有用了”；开发环境仍未独立完成真实账号的端到端登录、刷新和两账号切换验证。0.1.3 保留相同授权及凭据实现，只优化界面与管理交互。28 项后端离线回归测试通过，界面交互使用合成账号验证，详见 `docs/VALIDATION.md`。
+
+## 0.2.0 额度与布局
+
+- 产品更名为 Devin Account Manager（Devin 账户管理器）。应用标识和原本地数据目录保持兼容，已有账号不需要重新导入。
+- 直接复用 Cockpit Tools 的前端数据提取与额度解析，展示每日/每周剩余百分比、Credits 余额/总量、重置时间和已缓存状态，支持 JSON、snake_case 与二进制 protobuf 快照。
+- 缺失额度明确显示暂无数据；已用与剩余方向按上游 Rust 解码语义对齐，零剩余不会被当作缺失。
+- 移除顶部账号概览、常驻客户端状态条；状态与重新检测放进客户端设置。
+- 成功提示右上角显示约 4.5 秒后消失，可提前关闭；错误信息保留，支持关闭。
+- 额度通过原有刷新按钮查询，不新增账号协议或复杂图表。
+
+测试：`node scripts/test-quota.cjs`；界面检查脚本见下方开发说明。截图均为合成账号和合成额度，不展示真实用户信息。
 
 ## 0.1.5 网络连接修正
 
