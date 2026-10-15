@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Devin Switcher",
+  "version": "0.1.5",
+  "identifier": "local.devin-switcher.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Devin Switcher",
+        "width": 1120,
+        "height": 780,
+        "minWidth": 720,
+        "minHeight": 560
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost; img-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "shortDescription": "Devin Desktop account manager",
+    "license": "CC-BY-NC-SA-4.0",
+    "publisher": "Devin Switcher contributors",
+    "licenseFile": "../LICENSE.txt",
+    "resources": {
+      "../NOTICE.md": "NOTICE.md",
+      "../LICENSE.txt": "LICENSE.txt",
+      "../README.md": "README.md",
+      "../docs/UPSTREAM-README.md": "UPSTREAM-README.md"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico"
+      }
+    }
+  }
+}

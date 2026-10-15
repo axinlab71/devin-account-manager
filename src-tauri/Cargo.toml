@@ -1,0 +1,52 @@
+[package]
+name = "devin-switcher"
+version = "0.1.5"
+description = "Devin account switcher extracted from Cockpit Tools"
+authors = ["jlcodes", "Devin Switcher contributors"]
+license = "CC-BY-NC-SA-4.0"
+edition = "2021"
+
+[lib]
+name = "devin_switcher_lib"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = "0.4"
+dirs = "5"
+reqwest = { version = "0.12", features = ["json", "gzip", "brotli", "deflate", "socks"] }
+tokio = { version = "1", features = ["full"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+md5 = "0.7"
+url = "2.5"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+aes-gcm = "0.10"
+aes = "0.8"
+cbc = "0.1"
+pbkdf2 = "0.12"
+sha1 = "0.10"
+tiny_http = "0.12"
+sysinfo = "0.33"
+fs2 = "0.4"
+futures = "0.3"
+lazy_static = "1.5"
+urlencoding = "2.1"
+open = "5.3"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+winreg = "0.56"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

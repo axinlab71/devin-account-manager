@@ -1,0 +1,2242 @@
+use std::collections::{HashMap, HashSet};
+#[cfg(not(target_os = "macos"))]
+use std::ffi::OsString;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+#[cfg(not(target_os = "macos"))]
+use std::process::Stdio;
+use std::sync::Mutex;
+
+#[cfg(not(target_os = "windows"))]
+use aes::Aes128;
+#[cfg(target_os = "windows")]
+use aes_gcm::aead::generic_array::GenericArray;
+#[cfg(target_os = "windows")]
+use aes_gcm::aead::{Aead, AeadCore, OsRng};
+#[cfg(target_os = "windows")]
+use aes_gcm::{Aes256Gcm, KeyInit};
+#[cfg(target_os = "windows")]
+use base64::{engine::general_purpose, Engine as _};
+#[cfg(not(target_os = "windows"))]
+use cbc::cipher::block_padding::Pkcs7;
+#[cfg(not(target_os = "windows"))]
+use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+use chrono::Utc;
+#[cfg(not(target_os = "windows"))]
+use pbkdf2::pbkdf2_hmac;
+use rusqlite::{Connection, OptionalExtension};
+use serde_json::Value;
+#[cfg(not(target_os = "windows"))]
+use sha1::Sha1;
+#[cfg(not(target_os = "macos"))]
+use sysinfo::{ProcessRefreshKind, System, UpdateKind};
+use uuid::Uuid;
+
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{LocalFree, HLOCAL};
+#[cfg(target_os = "windows")]
+use windows::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
+
+use crate::models::windsurf::WindsurfAccount;
+use crate::modules;
+use crate::modules::windsurf_account;
+
+static WINDSURF_INSTANCE_STORE_LOCK: std::sync::LazyLock<Mutex<()>> =
+    std::sync::LazyLock::new(|| Mutex::new(()));
+
+const WINDSURF_INSTANCES_FILE: &str = "windsurf_instances.json";
+const WINDSURF_DEFAULT_API_SERVER_URL: &str = "https://server.codeium.com";
+const WINDSURF_AUTH_STATUS_KEY: &str = "windsurfAuthStatus";
+const WINDSURF_SESSIONS_SECRET_KEY: &str =
+    r#"secret://{"extensionId":"codeium.windsurf","key":"windsurf_auth.sessions"}"#;
+const WINDSURF_API_SERVER_SECRET_KEY: &str =
+    r#"secret://{"extensionId":"codeium.windsurf","key":"windsurf_auth.apiServerUrl"}"#;
+const WINDSURF_SELECTED_AUTH_KEY: &str = "codeium.windsurf-windsurf_auth";
+const WINDSURF_EXTENSION_STATE_KEY: &str = "codeium.windsurf";
+
+const V10_PREFIX: &[u8] = b"v10";
+const V11_PREFIX: &[u8] = b"v11";
+#[cfg(not(target_os = "windows"))]
+const CBC_IV: [u8; 16] = [b' '; 16];
+#[cfg(not(target_os = "windows"))]
+const SALT: &[u8] = b"saltysalt";
+
+#[cfg(not(target_os = "windows"))]
+type Aes128CbcEnc = cbc::Encryptor<Aes128>;
+
+#[cfg(target_os = "linux")]
+const LINUX_V10_KEY: [u8; 16] = [
+    0xfd, 0x62, 0x1f, 0xe5, 0xa2, 0xb4, 0x02, 0x53, 0x9d, 0xfa, 0x14, 0x7c, 0xa9, 0x27, 0x27, 0x78,
+];
+
+fn normalize_non_empty_text(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| text.to_string())
+}
+
+fn pick_string_from_object(obj: Option<&Value>, keys: &[&str]) -> Option<String> {
+    let obj = obj.and_then(Value::as_object)?;
+    for key in keys {
+        if let Some(text) = obj.get(*key).and_then(Value::as_str) {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn resolve_account_api_key(account: &WindsurfAccount) -> Option<String> {
+    normalize_non_empty_text(account.windsurf_api_key.as_deref())
+        .or_else(|| {
+            pick_string_from_object(
+                account.windsurf_auth_status_raw.as_ref(),
+                &["apiKey", "api_key"],
+            )
+        })
+        .or_else(|| {
+            normalize_non_empty_text(Some(account.github_access_token.as_str()))
+                .filter(|token| token.starts_with("sk-ws-") || token.starts_with("cog_"))
+        })
+}
+
+fn is_supported_windsurf_auth_token(token: &str) -> bool {
+    token.starts_with("sk-ws-01-")
+        || token.starts_with("devin-session-token$")
+        || token.starts_with("cog_")
+}
+
+fn account_uses_auth1(account: &WindsurfAccount) -> bool {
+    normalize_non_empty_text(account.windsurf_auth_token.as_deref())
+        .map(|token| token.starts_with("devin-session-token$"))
+        .unwrap_or(false)
+        || normalize_non_empty_text(Some(account.github_access_token.as_str()))
+            .map(|token| token.starts_with("devin-session-token$"))
+            .unwrap_or(false)
+        || pick_string_from_object(
+            account.windsurf_auth_status_raw.as_ref(),
+            &["authMethod", "auth_method"],
+        )
+        .map(|value| value.eq_ignore_ascii_case("auth1"))
+        .unwrap_or(false)
+}
+
+fn resolve_account_session_access_token(account: &WindsurfAccount) -> Option<String> {
+    // Auth1 账号优先注入 devin-session-token$，避免客户端启动后继续走 API key 迁移链路。
+    let session_token = normalize_non_empty_text(account.windsurf_auth_token.as_deref())
+        .filter(|token| token.starts_with("devin-session-token$"))
+        .or_else(|| {
+            normalize_non_empty_text(Some(account.github_access_token.as_str()))
+                .filter(|token| token.starts_with("devin-session-token$"))
+        })
+        .or_else(|| {
+            pick_string_from_object(
+                account.windsurf_auth_status_raw.as_ref(),
+                &["sessionToken", "session_token"],
+            )
+            .filter(|token| token.starts_with("devin-session-token$"))
+        });
+    if session_token.is_some() {
+        return session_token;
+    }
+    if account_uses_auth1(account) {
+        return None;
+    }
+    resolve_account_api_key(account)
+}
+
+fn resolve_account_api_server_url(account: &WindsurfAccount, auth_status: &Value) -> String {
+    normalize_non_empty_text(account.windsurf_api_server_url.as_deref())
+        .or_else(|| pick_string_from_object(Some(auth_status), &["apiServerUrl", "api_server_url"]))
+        .unwrap_or_else(|| WINDSURF_DEFAULT_API_SERVER_URL.to_string())
+}
+
+fn resolve_account_label(account: &WindsurfAccount, auth_status: &Value) -> String {
+    normalize_non_empty_text(account.github_name.as_deref())
+        .or_else(|| pick_string_from_object(Some(auth_status), &["name"]))
+        .or_else(|| normalize_non_empty_text(account.github_email.as_deref()))
+        .or_else(|| pick_string_from_object(Some(auth_status), &["email"]))
+        .or_else(|| normalize_non_empty_text(Some(account.github_login.as_str())))
+        .unwrap_or_else(|| "windsurf_user".to_string())
+}
+
+fn decode_buffer_data(buffer: &Value) -> Result<Vec<u8>, String> {
+    let data_arr = buffer["data"]
+        .as_array()
+        .ok_or("Secret data 不是 Buffer 数组格式")?;
+
+    let mut encrypted_bytes: Vec<u8> = Vec::with_capacity(data_arr.len());
+    for (idx, v) in data_arr.iter().enumerate() {
+        let n = v
+            .as_u64()
+            .ok_or_else(|| format!("Secret data 第 {} 项不是整数", idx))?;
+        if n > 255 {
+            return Err(format!("Secret data 第 {} 项超过字节范围: {}", idx, n));
+        }
+        encrypted_bytes.push(n as u8);
+    }
+
+    Ok(encrypted_bytes)
+}
+
+fn detect_prefix(encrypted: &[u8]) -> Option<&'static str> {
+    if encrypted.starts_with(V10_PREFIX) {
+        Some("v10")
+    } else if encrypted.starts_with(V11_PREFIX) {
+        Some("v11")
+    } else {
+        None
+    }
+}
+
+fn query_existing_secret_prefix(conn: &Connection, key: &str) -> Result<Option<String>, String> {
+    let existing: Option<String> = conn
+        .query_row("SELECT value FROM ItemTable WHERE key = ?1", [key], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|e| format!("读取 secret 失败({}): {}", key, e))?;
+
+    let Some(existing_value) = existing else {
+        return Ok(None);
+    };
+
+    let parsed: Value = match serde_json::from_str(&existing_value) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let encrypted_bytes = match decode_buffer_data(&parsed) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    Ok(detect_prefix(&encrypted_bytes).map(|prefix| prefix.to_string()))
+}
+
+fn upsert_item(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?1, ?2)",
+        (key, value),
+    )
+    .map_err(|e| format!("写入 {} 失败: {}", key, e))?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn get_local_state_path(data_root: &Path) -> Result<PathBuf, String> {
+    let path = data_root.join("Local State");
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err(format!("Windsurf Local State 不存在: {}", path.display()))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn dpapi_decrypt(encrypted: &[u8]) -> Result<Vec<u8>, String> {
+    unsafe {
+        let mut input = CRYPT_INTEGER_BLOB {
+            cbData: encrypted.len() as u32,
+            pbData: encrypted.as_ptr() as *mut u8,
+        };
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+
+        CryptUnprotectData(&mut input, None, None, None, None, 0, &mut output)
+            .map_err(|_| "DPAPI CryptUnprotectData 调用失败".to_string())?;
+
+        let result = std::slice::from_raw_parts(output.pbData, output.cbData as usize).to_vec();
+        LocalFree(HLOCAL(output.pbData as *mut _));
+        Ok(result)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn get_windows_encryption_key(data_root: &Path) -> Result<Vec<u8>, String> {
+    let path = get_local_state_path(data_root)?;
+    let content =
+        std::fs::read_to_string(&path).map_err(|e| format!("读取 Local State 失败: {}", e))?;
+
+    let json: Value =
+        serde_json::from_str(&content).map_err(|e| format!("解析 Local State JSON 失败: {}", e))?;
+    let encrypted_key_b64 = json["os_crypt"]["encrypted_key"]
+        .as_str()
+        .ok_or("Local State 缺少 os_crypt.encrypted_key")?;
+    let encrypted_key_bytes = general_purpose::STANDARD
+        .decode(encrypted_key_b64)
+        .map_err(|e| format!("Base64 解码 encrypted_key 失败: {}", e))?;
+
+    if encrypted_key_bytes.len() < 6 {
+        return Err("encrypted_key 长度异常".to_string());
+    }
+    if &encrypted_key_bytes[..5] != b"DPAPI" {
+        return Err("encrypted_key 前缀不是 DPAPI".to_string());
+    }
+
+    let key = dpapi_decrypt(&encrypted_key_bytes[5..])?;
+    if key.len() != 32 {
+        return Err(format!("解密后的 AES key 长度异常: {}", key.len()));
+    }
+    Ok(key)
+}
+
+#[cfg(target_os = "windows")]
+fn encrypt_windows_gcm_v10(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    let cipher = Aes256Gcm::new(GenericArray::from_slice(key));
+    let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+    let ciphertext = cipher
+        .encrypt(&nonce, plaintext)
+        .map_err(|e| format!("AES-GCM 加密失败: {}", e))?;
+
+    let mut result = Vec::with_capacity(3 + 12 + ciphertext.len());
+    result.extend_from_slice(V10_PREFIX);
+    result.extend_from_slice(nonce.as_slice());
+    result.extend_from_slice(&ciphertext);
+    Ok(result)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn encrypt_cbc_prefixed(
+    prefix: &[u8],
+    key: &[u8; 16],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, String> {
+    let cipher = Aes128CbcEnc::new_from_slices(key, &CBC_IV)
+        .map_err(|e| format!("初始化 AES-CBC encryptor 失败: {}", e))?;
+
+    let mut buf = plaintext.to_vec();
+    let msg_len = buf.len();
+    let pad_len = 16 - (msg_len % 16);
+    buf.resize(msg_len + pad_len, 0);
+    let ciphertext = cipher
+        .encrypt_padded_mut::<Pkcs7>(&mut buf, msg_len)
+        .map_err(|e| format!("AES-CBC 加密失败: {}", e))?
+        .to_vec();
+
+    let mut result = Vec::with_capacity(prefix.len() + ciphertext.len());
+    result.extend_from_slice(prefix);
+    result.extend_from_slice(&ciphertext);
+    Ok(result)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn pbkdf2_sha1_key(password: &str, iterations: u32) -> [u8; 16] {
+    let mut key = [0u8; 16];
+    pbkdf2_hmac::<Sha1>(password.as_bytes(), SALT, iterations, &mut key);
+    key
+}
+
+#[cfg(target_os = "macos")]
+fn run_command_get_trimmed(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn path_brand_prefers_windsurf(data_root: &Path) -> bool {
+    let text = data_root.to_string_lossy().to_lowercase();
+    text.contains("windsurf") && !text.contains("devin")
+}
+
+#[cfg(target_os = "macos")]
+fn get_macos_safe_storage_password(data_root: &Path) -> Result<String, String> {
+    // Windsurf 重命名为 Devin 后，Keychain 服务名变为 "Devin Safe Storage"。
+    // 本地实测账号字段为 "Devin" / "Devin Key"；旧安装仍可能是 "Windsurf Key"。
+    // 按 profile 目录品牌优先选 keychain，避免双装时用错密钥。
+    let devin_candidates = [
+        ("Devin Safe Storage", Some("Devin")),
+        ("Devin Safe Storage", Some("Devin Key")),
+        ("Devin Safe Storage", Some("devin")),
+        ("Devin Safe Storage", None),
+    ];
+    let windsurf_candidates = [
+        ("Windsurf Safe Storage", Some("Windsurf Key")),
+        ("Windsurf Safe Storage", Some("Windsurf")),
+        ("Windsurf Safe Storage", Some("windsurf")),
+        ("Windsurf Safe Storage", Some("Windsurf Safe Storage")),
+        ("Windsurf Safe Storage", None),
+    ];
+
+    let ordered: Vec<(&str, Option<&str>)> = if path_brand_prefers_windsurf(data_root) {
+        windsurf_candidates
+            .into_iter()
+            .chain(devin_candidates.into_iter())
+            .collect()
+    } else {
+        devin_candidates
+            .into_iter()
+            .chain(windsurf_candidates.into_iter())
+            .collect()
+    };
+
+    for (service, account) in ordered {
+        if let Some(account) = account {
+            if let Some(password) = run_command_get_trimmed(
+                "security",
+                &["find-generic-password", "-w", "-s", service, "-a", account],
+            ) {
+                return Ok(password);
+            }
+        } else if let Some(password) =
+            run_command_get_trimmed("security", &["find-generic-password", "-w", "-s", service])
+        {
+            return Ok(password);
+        }
+    }
+
+    Err("读取 Devin/Windsurf Safe Storage 密钥失败".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn run_command_get_trimmed(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_linux_v11_key() -> Option<[u8; 16]> {
+    let app_names = ["devin", "Devin", "windsurf", "Windsurf"];
+    for app in app_names {
+        if let Some(password) =
+            run_command_get_trimmed("secret-tool", &["lookup", "application", app])
+        {
+            return Some(pbkdf2_sha1_key(&password, 1));
+        }
+    }
+    None
+}
+
+fn encrypt_secret_payload(
+    plaintext: &[u8],
+    preferred_prefix: Option<&str>,
+    data_root: &Path,
+) -> Result<Vec<u8>, String> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = preferred_prefix;
+    #[cfg(target_os = "linux")]
+    let _ = data_root;
+
+    #[cfg(target_os = "windows")]
+    {
+        let key = get_windows_encryption_key(data_root)?;
+        return encrypt_windows_gcm_v10(&key, plaintext);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let password = get_macos_safe_storage_password(data_root)?;
+        let key = pbkdf2_sha1_key(&password, 1003);
+        return encrypt_cbc_prefixed(V10_PREFIX, &key, plaintext);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let target_prefix = if let Some(prefix) = preferred_prefix {
+            prefix
+        } else if get_linux_v11_key().is_some() {
+            "v11"
+        } else {
+            "v10"
+        };
+
+        if target_prefix == "v11" {
+            let key = get_linux_v11_key()
+                .ok_or("无法读取 Linux Secret Service 密钥（v11）".to_string())?;
+            return encrypt_cbc_prefixed(V11_PREFIX, &key, plaintext);
+        }
+
+        return encrypt_cbc_prefixed(V10_PREFIX, &LINUX_V10_KEY, plaintext);
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (plaintext, preferred_prefix, data_root);
+        Err("不支持的系统平台".to_string())
+    }
+}
+
+fn encode_encrypted_buffer_json(
+    plaintext: &[u8],
+    preferred_prefix: Option<&str>,
+    data_root: &Path,
+) -> Result<String, String> {
+    let encrypted = encrypt_secret_payload(plaintext, preferred_prefix, data_root)?;
+    serde_json::to_string(&serde_json::json!({
+        "type": "Buffer",
+        "data": encrypted
+    }))
+    .map_err(|e| format!("序列化 Buffer 失败: {}", e))
+}
+
+fn upsert_windsurf_extension_state(
+    conn: &Connection,
+    api_server_url: &str,
+    access_token: &str,
+) -> Result<(), String> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            [WINDSURF_EXTENSION_STATE_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("读取 {} 失败: {}", WINDSURF_EXTENSION_STATE_KEY, e))?;
+
+    let mut state = existing
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    if let Some(obj) = state.as_object_mut() {
+        obj.insert(
+            "apiServerUrl".to_string(),
+            Value::String(api_server_url.to_string()),
+        );
+        // 官方扩展优先读取 pendingApiKeyMigration；这里写入可用 token，避免再次触发迁移链路。
+        if is_supported_windsurf_auth_token(access_token) {
+            obj.insert(
+                "windsurf.pendingApiKeyMigration".to_string(),
+                Value::String(access_token.to_string()),
+            );
+        } else {
+            obj.remove("windsurf.pendingApiKeyMigration");
+        }
+        // 关键: codeium.installationId 必须存在 — 缺这个字段 Windsurf 反作弊会把这次切号
+        // 当作"新机器登录"，触发额外验证 / Permission denied (error 12)。
+        // 优先保留原有值（同一机器多次切号要稳定），不存在才生成新的。
+        if !obj
+            .get("codeium.installationId")
+            .map(|v| v.is_string() && !v.as_str().unwrap_or("").trim().is_empty())
+            .unwrap_or(false)
+        {
+            obj.insert(
+                "codeium.installationId".to_string(),
+                Value::String(Uuid::new_v4().to_string()),
+            );
+        }
+    }
+
+    let serialized = serde_json::to_string(&state)
+        .map_err(|e| format!("序列化 {} 失败: {}", WINDSURF_EXTENSION_STATE_KEY, e))?;
+    upsert_item(conn, WINDSURF_EXTENSION_STATE_KEY, &serialized)
+}
+
+fn write_windsurf_auth_data(
+    conn: &Connection,
+    profile_dir: &Path,
+    auth_status: &Value,
+    account_label: &str,
+    access_token: &str,
+    api_server_url: &str,
+) -> Result<(), String> {
+    let auth_status_content = serde_json::to_string(auth_status)
+        .map_err(|e| format!("序列化 windsurfAuthStatus 失败: {}", e))?;
+    upsert_item(conn, WINDSURF_AUTH_STATUS_KEY, &auth_status_content)?;
+
+    let existing_sessions_prefix =
+        query_existing_secret_prefix(conn, WINDSURF_SESSIONS_SECRET_KEY)?;
+    let sessions_payload = serde_json::json!([{
+        "id": Uuid::new_v4().to_string(),
+        "accessToken": access_token,
+        "account": {
+            "label": account_label,
+            "id": account_label
+        },
+        "scopes": []
+    }]);
+    let sessions_plain = serde_json::to_string(&sessions_payload)
+        .map_err(|e| format!("序列化 windsurf_auth.sessions 失败: {}", e))?;
+    let encrypted_sessions = encode_encrypted_buffer_json(
+        sessions_plain.as_bytes(),
+        existing_sessions_prefix.as_deref(),
+        profile_dir,
+    )?;
+    upsert_item(conn, WINDSURF_SESSIONS_SECRET_KEY, &encrypted_sessions)?;
+
+    let existing_api_server_prefix =
+        query_existing_secret_prefix(conn, WINDSURF_API_SERVER_SECRET_KEY)?;
+    let encrypted_api_server = encode_encrypted_buffer_json(
+        api_server_url.as_bytes(),
+        existing_api_server_prefix.as_deref(),
+        profile_dir,
+    )?;
+    upsert_item(conn, WINDSURF_API_SERVER_SECRET_KEY, &encrypted_api_server)?;
+
+    upsert_item(conn, WINDSURF_SELECTED_AUTH_KEY, account_label)?;
+    upsert_windsurf_extension_state(conn, api_server_url, access_token)?;
+
+    // Onboarding 状态：标记新手向导已完成，避免 Windsurf 启动后弹引导浮窗
+    let onboarding = serde_json::json!({
+        "completed": true,
+        "version": 1,
+        "timestamp": Utc::now().timestamp_millis(),
+    });
+    upsert_item(
+        conn,
+        "windsurfOnboarding",
+        &serde_json::to_string(&onboarding)
+            .map_err(|e| format!("序列化 windsurfOnboarding 失败: {}", e))?,
+    )?;
+
+    conn.execute("DELETE FROM ItemTable WHERE key LIKE 'windsurf_auth-%'", [])
+        .map_err(|e| format!("清理旧 windsurf_auth-* 键失败: {}", e))?;
+
+    let login_key = format!("windsurf_auth-{}", account_label);
+    let usage_key = format!("windsurf_auth-{}-usages", account_label);
+    // 本地 Devin 3.x 写入的 extensionName 为 "Devin"；旧 Windsurf 为 "Windsurf"。
+    // 统一写 Devin 以匹配当前客户端字段，旧客户端忽略该展示字段。
+    let usage_value = serde_json::json!([{
+        "extensionId": "codeium.windsurf",
+        "extensionName": "Devin",
+        "scopes": [],
+        "lastUsed": Utc::now().timestamp_millis()
+    }]);
+    upsert_item(conn, &login_key, "[]")?;
+    upsert_item(
+        conn,
+        &usage_key,
+        &serde_json::to_string(&usage_value).map_err(|e| format!("序列化 usages 失败: {}", e))?,
+    )?;
+
+    Ok(())
+}
+
+/// 返回 Devin/Windsurf 用户数据目录候选（新品牌优先）。
+pub fn windsurf_user_data_dir_candidates() -> Result<Vec<PathBuf>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
+        let base = home.join("Library/Application Support");
+        return Ok(vec![base.join("Devin"), base.join("Windsurf")]);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let appdata =
+            std::env::var("APPDATA").map_err(|_| "无法获取 APPDATA 环境变量".to_string())?;
+        let base = PathBuf::from(appdata);
+        return Ok(vec![base.join("Devin"), base.join("Windsurf")]);
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
+        let base = home.join(".config");
+        return Ok(vec![base.join("Devin"), base.join("Windsurf")]);
+    }
+
+    #[allow(unreachable_code)]
+    Err("Windsurf 应用多开仅支持 macOS、Windows 和 Linux".to_string())
+}
+
+fn state_db_under_user_data_dir(user_data_dir: &Path) -> PathBuf {
+    user_data_dir
+        .join("User")
+        .join("globalStorage")
+        .join("state.vscdb")
+}
+
+fn state_db_score(db_path: &Path) -> i32 {
+    if !db_path.is_file() {
+        return 0;
+    }
+    let Ok(conn) = Connection::open(db_path) else {
+        // 文件存在但无法打开时，仍高于“无文件”
+        return 10;
+    };
+    let mut score = 10;
+    if let Ok(Some(raw)) = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            [WINDSURF_EXTENSION_STATE_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+    {
+        score += 20;
+        if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+            let has_installation_id = value
+                .get("codeium.installationId")
+                .and_then(Value::as_str)
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false);
+            if has_installation_id {
+                score += 100;
+            }
+        }
+    }
+    if let Ok(Some(_)) = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            [WINDSURF_AUTH_STATUS_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+    {
+        score += 30;
+    }
+    score
+}
+
+/// 在 Devin/Windsurf 候选目录中挑选最合适的默认用户数据目录。
+/// 优先级：含 installationId 的 state.vscdb > 含登录态的 state.vscdb > 任意 state.vscdb
+/// > 已存在目录 > 首个候选（Devin）。
+pub fn pick_preferred_windsurf_user_data_dir(candidates: &[PathBuf]) -> PathBuf {
+    if candidates.is_empty() {
+        return PathBuf::from("Devin");
+    }
+
+    let mut best_dir: Option<&PathBuf> = None;
+    let mut best_score = i32::MIN;
+    for dir in candidates {
+        let score = state_db_score(&state_db_under_user_data_dir(dir));
+        if score > best_score {
+            best_score = score;
+            best_dir = Some(dir);
+        }
+    }
+    if best_score > 0 {
+        if let Some(dir) = best_dir {
+            return dir.clone();
+        }
+    }
+
+    for dir in candidates {
+        if dir.is_dir() {
+            return dir.clone();
+        }
+    }
+    candidates[0].clone()
+}
+
+pub fn get_default_windsurf_user_data_dir() -> Result<PathBuf, String> {
+    let candidates = windsurf_user_data_dir_candidates()?;
+    Ok(pick_preferred_windsurf_user_data_dir(&candidates))
+}
+
+fn normalize_path_for_compare(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let resolved = fs::canonicalize(trimmed)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| trimmed.to_string());
+
+    #[cfg(target_os = "windows")]
+    {
+        return resolved.to_lowercase();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        resolved
+    }
+}
+
+fn normalize_non_empty_path(value: Option<&str>) -> Option<String> {
+    value
+        .map(normalize_path_for_compare)
+        .filter(|text| !text.is_empty())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn parse_user_data_dir_value(raw: &str) -> Option<String> {
+    let rest = raw.trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    let value = if rest.starts_with('"') {
+        let end = rest[1..].find('"').map(|idx| idx + 1).unwrap_or(rest.len());
+        &rest[1..end]
+    } else if rest.starts_with('\'') {
+        let end = rest[1..]
+            .find('\'')
+            .map(|idx| idx + 1)
+            .unwrap_or(rest.len());
+        &rest[1..end]
+    } else {
+        let end = rest.find(" --").unwrap_or(rest.len());
+        &rest[..end]
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn extract_user_data_dir(args: &[OsString]) -> Option<String> {
+    let tokens: Vec<String> = args
+        .iter()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect();
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        if let Some(rest) = token.strip_prefix("--user-data-dir=") {
+            return parse_user_data_dir_value(rest);
+        }
+        if token == "--user-data-dir" {
+            index += 1;
+            if index >= tokens.len() {
+                return None;
+            }
+            let mut parts = Vec::new();
+            while index < tokens.len() {
+                let part = tokens[index].as_str();
+                if part.starts_with("--") {
+                    break;
+                }
+                parts.push(part);
+                index += 1;
+            }
+            if parts.is_empty() {
+                return None;
+            }
+            return Some(parts.join(" "));
+        }
+        index += 1;
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn split_command_tokens(command_line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+
+    for ch in command_line.chars() {
+        match quote {
+            Some(q) => {
+                if ch == q {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            None => {
+                if ch == '"' || ch == '\'' {
+                    quote = Some(ch);
+                } else if ch.is_whitespace() {
+                    if !current.is_empty() {
+                        tokens.push(current.clone());
+                        current.clear();
+                    }
+                } else {
+                    current.push(ch);
+                }
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+#[cfg(target_os = "macos")]
+fn extract_user_data_dir_from_command_line(command_line: &str) -> Option<String> {
+    let tokens = split_command_tokens(command_line);
+    let mut index = 0;
+    while index < tokens.len() {
+        let token = tokens[index].as_str();
+        if let Some(rest) = token.strip_prefix("--user-data-dir=") {
+            if !rest.trim().is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+        if token == "--user-data-dir" {
+            index += 1;
+            if index >= tokens.len() {
+                return None;
+            }
+            let mut parts = Vec::new();
+            while index < tokens.len() {
+                let part = tokens[index].as_str();
+                if part.starts_with("--") {
+                    break;
+                }
+                parts.push(part);
+                index += 1;
+            }
+            if !parts.is_empty() {
+                return Some(parts.join(" "));
+            }
+            return None;
+        }
+        index += 1;
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_helper_process(name: &str, args_line: &str) -> bool {
+    args_line.contains("--type=")
+        || name.contains("helper")
+        || name.contains("renderer")
+        || name.contains("gpu")
+        || name.contains("utility")
+        || name.contains("crashpad")
+        || name.contains("sandbox")
+}
+
+fn command_trace_enabled() -> bool {
+    if let Ok(value) = std::env::var("COCKPIT_COMMAND_TRACE") {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => return true,
+            "0" | "false" | "no" | "off" => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+fn quote_command_part(part: &str) -> String {
+    if part.is_empty() {
+        return "\"\"".to_string();
+    }
+    let needs_quote = part
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '$' | '`' | '|' | '&' | ';'));
+    if needs_quote {
+        format!("{:?}", part)
+    } else {
+        part.to_string()
+    }
+}
+
+fn format_command_preview(command: &Command) -> String {
+    let program = quote_command_part(command.get_program().to_string_lossy().as_ref());
+    let args = command
+        .get_args()
+        .map(|arg| quote_command_part(arg.to_string_lossy().as_ref()))
+        .collect::<Vec<String>>();
+    let preview = if args.is_empty() {
+        program
+    } else {
+        format!("{} {}", program, args.join(" "))
+    };
+    modules::process::summarize_text_for_process_log(&preview, 600)
+}
+
+fn spawn_command_with_trace(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    let preview = format_command_preview(cmd);
+    if command_trace_enabled() {
+        modules::logger::log_info(&format!("[CmdTrace][Windsurf] EXEC {}", preview));
+    }
+    let start = std::time::Instant::now();
+    let result = cmd.spawn();
+    if command_trace_enabled() {
+        match &result {
+            Ok(child) => modules::logger::log_info(&format!(
+                "[CmdTrace][Windsurf] SPAWN elapsed={}ms pid={} cmd={}",
+                start.elapsed().as_millis(),
+                child.id(),
+                preview
+            )),
+            Err(err) => modules::logger::log_warn(&format!(
+                "[CmdTrace][Windsurf] SPAWN_ERROR elapsed={}ms cmd={} err={}",
+                start.elapsed().as_millis(),
+                preview,
+                err
+            )),
+        }
+    }
+    result
+}
+
+fn collect_running_process_exe_by_pid() -> HashMap<u32, String> {
+    let mut map = HashMap::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        // Use ps to avoid sysinfo TCC dialogs on macOS
+        if let Ok(output) = Command::new("ps")
+            .args(["-axww", "-o", "pid=,command="])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let mut parts = line.splitn(2, |ch: char| ch.is_whitespace());
+                let pid_str = parts.next().unwrap_or("").trim();
+                let cmdline = parts.next().unwrap_or("").trim();
+                let pid = match pid_str.parse::<u32>() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let lower = cmdline.to_lowercase();
+                let exe = if let Some(contents_pos) = lower.find(".app/contents/macos/") {
+                    let after = contents_pos + ".app/contents/macos/".len();
+                    let rest = &cmdline[after..];
+                    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+                    &cmdline[..after + end]
+                } else {
+                    cmdline.split_whitespace().next().unwrap_or("")
+                };
+                if !exe.is_empty() {
+                    let normalized = normalize_path_for_compare(exe);
+                    if !normalized.is_empty() {
+                        map.insert(pid, normalized);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet),
+        );
+        for (pid, process) in system.processes() {
+            let Some(exe) = process.exe().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let normalized = normalize_path_for_compare(exe);
+            if normalized.is_empty() {
+                continue;
+            }
+            map.insert(pid.as_u32(), normalized);
+        }
+    }
+
+    map
+}
+
+fn resolve_expected_windsurf_launch_path_for_match() -> Option<String> {
+    let launch_path = match resolve_windsurf_launch_path() {
+        Ok(path) => path,
+        Err(err) => {
+            modules::logger::log_warn(&format!(
+                "[Windsurf Resolve] 启动路径未配置或无效，跳过 PID 匹配: {}",
+                err
+            ));
+            return None;
+        }
+    };
+    let normalized = normalize_path_for_compare(launch_path.to_string_lossy().as_ref());
+    if normalized.is_empty() {
+        modules::logger::log_warn("[Windsurf Resolve] 启动路径为空，跳过 PID 匹配");
+        return None;
+    }
+    Some(normalized)
+}
+
+fn normalize_windsurf_launch_identity(path: &str) -> Option<String> {
+    let normalized = normalize_path_for_compare(path);
+    if normalized.is_empty() {
+        return None;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(index) = normalized.find(".app") {
+            return Some(normalized[..index + 4].to_string());
+        }
+    }
+    Some(normalized)
+}
+
+fn filter_windsurf_entries_by_launch_path(
+    entries: Vec<(u32, Option<String>)>,
+    expected: Option<String>,
+) -> Vec<(u32, Option<String>)> {
+    if entries.is_empty() {
+        return entries;
+    }
+    let Some(expected) = expected else {
+        return entries;
+    };
+    let expected_identity = normalize_windsurf_launch_identity(&expected);
+    let Some(expected_identity) = expected_identity else {
+        return entries;
+    };
+    let exe_by_pid = collect_running_process_exe_by_pid();
+    let mut result = Vec::new();
+    let mut missing_exe = 0usize;
+    let mut path_mismatch = 0usize;
+    for (pid, dir) in &entries {
+        match exe_by_pid.get(pid) {
+            Some(actual) => {
+                let actual_identity = normalize_windsurf_launch_identity(actual);
+                if actual_identity.as_deref() == Some(expected_identity.as_str()) {
+                    result.push((*pid, dir.clone()));
+                } else {
+                    path_mismatch += 1;
+                }
+            }
+            None => missing_exe += 1,
+        }
+    }
+    if result.is_empty() {
+        modules::logger::log_warn(&format!(
+            "[Windsurf Resolve] 启动路径硬匹配未命中：expected={}, path_mismatch={}, missing_exe={}",
+            expected, path_mismatch, missing_exe
+        ));
+        return entries;
+    }
+    result
+}
+
+pub fn collect_windsurf_process_entries() -> Vec<(u32, Option<String>)> {
+    let expected_launch = resolve_expected_windsurf_launch_path_for_match();
+
+    let mut entries: HashMap<u32, Option<String>> = HashMap::new();
+
+    // On macOS, skip sysinfo to avoid TCC dialogs
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing()
+                .with_exe(UpdateKind::OnlyIfNotSet)
+                .with_cmd(UpdateKind::OnlyIfNotSet),
+        );
+        let current_pid = std::process::id();
+
+        for (pid, process) in system.processes() {
+            let pid_u32 = pid.as_u32();
+            if pid_u32 == current_pid {
+                continue;
+            }
+
+            let name = process.name().to_string_lossy().to_lowercase();
+            let exe_path = process
+                .exe()
+                .and_then(|p| p.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let args_line = process
+                .cmd()
+                .iter()
+                .map(|arg| arg.to_string_lossy().to_lowercase())
+                .collect::<Vec<String>>()
+                .join(" ");
+
+            #[cfg(target_os = "windows")]
+            let is_windsurf = name == "windsurf.exe"
+                || name == "devin.exe"
+                || exe_path.ends_with("\\windsurf.exe")
+                || exe_path.ends_with("\\devin.exe")
+                || (name == "electron.exe"
+                    && (exe_path.contains("\\windsurf\\") || exe_path.contains("\\devin\\")));
+            #[cfg(target_os = "linux")]
+            let is_windsurf = name.contains("windsurf")
+                || name.contains("devin")
+                || exe_path.contains("/windsurf")
+                || exe_path.contains("/devin");
+
+            if !is_windsurf || is_helper_process(&name, &args_line) {
+                continue;
+            }
+
+            let dir = extract_user_data_dir(process.cmd()).and_then(|value| {
+                let normalized = normalize_path_for_compare(&value);
+                if normalized.is_empty() {
+                    None
+                } else {
+                    Some(normalized)
+                }
+            });
+            entries.insert(pid_u32, dir);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = Command::new("ps").args(["-axo", "pid,command"]).output() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines().skip(1) {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let mut parts = line.splitn(2, |ch: char| ch.is_whitespace());
+                let pid_str = parts.next().unwrap_or("").trim();
+                let cmdline = parts.next().unwrap_or("").trim();
+                let pid = match pid_str.parse::<u32>() {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+                let lower = cmdline.to_lowercase();
+                // Devin.app 为官网新包；Windsurf.app 兼容旧安装。
+                let is_devin_or_windsurf = lower.contains("devin.app/contents/")
+                    || lower.contains("windsurf.app/contents/");
+                if !is_devin_or_windsurf || lower.contains("--type=") {
+                    continue;
+                }
+                let dir = extract_user_data_dir_from_command_line(cmdline).and_then(|value| {
+                    let normalized = normalize_path_for_compare(&value);
+                    if normalized.is_empty() {
+                        None
+                    } else {
+                        Some(normalized)
+                    }
+                });
+                entries.entry(pid).or_insert(dir);
+            }
+        }
+    }
+
+    let mut result: Vec<(u32, Option<String>)> = entries.into_iter().collect();
+    result.sort_by_key(|(pid, _)| *pid);
+    filter_windsurf_entries_by_launch_path(result, expected_launch)
+}
+
+fn pick_preferred_pid(mut pids: Vec<u32>) -> Option<u32> {
+    if pids.is_empty() {
+        return None;
+    }
+    pids.sort();
+    pids.dedup();
+    pids.first().copied()
+}
+
+pub fn resolve_windsurf_pid_from_entries(
+    last_pid: Option<u32>,
+    user_data_dir: Option<&str>,
+    entries: &[(u32, Option<String>)],
+) -> Option<u32> {
+    let default_dir = get_default_windsurf_user_data_dir()
+        .ok()
+        .map(|dir| normalize_path_for_compare(&dir.to_string_lossy()));
+    let target = normalize_non_empty_path(user_data_dir).or(default_dir.clone());
+    let allow_none_for_target = default_dir
+        .as_ref()
+        .zip(target.as_ref())
+        .map(|(value, current)| value == current)
+        .unwrap_or(false);
+
+    let target = target?;
+
+    let mut matches = Vec::new();
+    for (pid, dir) in entries {
+        match dir.as_ref() {
+            Some(actual_dir) => {
+                let normalized = normalize_path_for_compare(actual_dir);
+                if !normalized.is_empty() && normalized == target {
+                    matches.push(*pid);
+                }
+            }
+            None if allow_none_for_target => matches.push(*pid),
+            _ => {}
+        }
+    }
+
+    if let Some(pid) = last_pid {
+        if modules::process::is_pid_running(pid) && matches.contains(&pid) {
+            return Some(pid);
+        }
+        if modules::process::is_pid_running(pid) {
+            modules::logger::log_warn(&format!(
+                "[Windsurf Resolve] 忽略不匹配的 last_pid={}，target={}，matched_pids={}",
+                pid,
+                modules::process::summarize_text_for_process_log(&target, 96),
+                modules::process::summarize_pid_list_for_log(&matches)
+            ));
+        }
+    }
+
+    pick_preferred_pid(matches)
+}
+
+pub fn resolve_windsurf_pid(last_pid: Option<u32>, user_data_dir: Option<&str>) -> Option<u32> {
+    let entries = collect_windsurf_process_entries();
+    resolve_windsurf_pid_from_entries(last_pid, user_data_dir, &entries)
+}
+
+fn normalize_custom_path(value: &str) -> Option<String> {
+    let normalized = modules::process::normalize_windows_user_facing_path(value);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn normalize_macos_app_root(path: &Path) -> Option<String> {
+    let path_str = path.to_string_lossy();
+    if let Some(index) = path_str.find(".app") {
+        return Some(path_str[..index + 4].to_string());
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn read_macos_bundle_string(app_root: &Path, key: &str) -> Option<String> {
+    let plist = app_root.join("Contents").join("Info.plist");
+    let plist_str = plist.to_str()?;
+    let output = Command::new("plutil")
+        .args(["-extract", key, "raw", "-o", "-", plist_str])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_macos_exec_path(path_str: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(path_str);
+    if let Some(app_root) = normalize_macos_app_root(&path) {
+        let app_root_path = PathBuf::from(&app_root);
+        let macos_dir = app_root_path.join("Contents").join("MacOS");
+        // Devin 的 CFBundleExecutable 为 "Devin"；旧 Windsurf 多为 "Electron"。
+        if let Some(exec_name) = read_macos_bundle_string(&app_root_path, "CFBundleExecutable") {
+            let exec_path = macos_dir.join(exec_name);
+            if exec_path.exists() {
+                return Some(exec_path);
+            }
+        }
+        for name in ["Devin", "Electron", "Windsurf"] {
+            let exec_path = macos_dir.join(name);
+            if exec_path.exists() {
+                return Some(exec_path);
+            }
+        }
+    }
+    if path.exists() {
+        return Some(path);
+    }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn resolve_macos_exec_path(path_str: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(path_str);
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn detect_windsurf_exec_path() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, check well-known path first to avoid sysinfo TCC dialogs
+        let candidates = [
+            "/Applications/Devin.app/Contents/MacOS/Devin",
+            "/Applications/Windsurf.app/Contents/MacOS/Electron",
+        ];
+        for candidate in candidates {
+            let path = PathBuf::from(candidate);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        // Fallback: try to find from running processes via ps
+        for (pid, _) in collect_windsurf_process_entries() {
+            if let Ok(output) = Command::new("ps")
+                .args(["-p", &pid.to_string(), "-o", "command="])
+                .output()
+            {
+                let cmdline = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let lower = cmdline.to_lowercase();
+                if let Some(contents_pos) = lower.find(".app/contents/macos/") {
+                    let after = contents_pos + ".app/contents/macos/".len();
+                    let rest = &cmdline[after..];
+                    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+                    return Some(PathBuf::from(&cmdline[..after + end]));
+                }
+            }
+        }
+        return None;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        for (pid, _) in collect_windsurf_process_entries() {
+            let mut system = System::new();
+            system.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet),
+            );
+            if let Some(process) = system.process(sysinfo::Pid::from(pid as usize)) {
+                if let Some(path) = process.exe() {
+                    return Some(path.to_path_buf());
+                }
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
+                let programs = Path::new(&local_appdata).join("Programs");
+                for folder in ["Devin", "Windsurf"] {
+                    for exe in ["Devin.exe", "Windsurf.exe", "Electron.exe"] {
+                        candidates.push(programs.join(folder).join(exe));
+                    }
+                }
+            }
+            for candidate in candidates {
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+            if let Some(path) = modules::process::detect_windows_exec_path_by_signatures(
+                "windsurf",
+                &["Devin.exe", "Windsurf.exe", "Electron.exe"],
+                &["devin", "windsurf"],
+                &["devin", "windsurf", "codeium", "exafunction"],
+                &["devin", "windsurf", "codeium", "exafunction"],
+            ) {
+                return Some(path);
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let candidates = [
+                "/usr/bin/devin",
+                "/opt/devin/devin",
+                "/usr/bin/windsurf",
+                "/opt/windsurf/windsurf",
+            ];
+            for candidate in candidates {
+                let path = PathBuf::from(candidate);
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+        }
+
+        return None;
+    }
+}
+
+fn path_looks_like_windsurf(path: &Path) -> bool {
+    let text = path.to_string_lossy().to_lowercase();
+    text.contains("devin") || text.contains("windsurf")
+}
+
+fn normalize_windsurf_path_for_config(path: &Path) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return normalize_macos_app_root(path).unwrap_or_else(|| {
+            modules::process::normalize_windows_user_facing_path(&path.to_string_lossy())
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        modules::process::normalize_windows_user_facing_path(&path.to_string_lossy())
+    }
+}
+
+pub fn detect_and_save_windsurf_launch_path(force: bool) -> Option<String> {
+    let current = modules::config::get_user_config();
+    if !force {
+        if let Some(configured) = normalize_custom_path(&current.windsurf_app_path) {
+            return Some(configured);
+        }
+    }
+
+    let detected = detect_windsurf_exec_path()?;
+    let normalized = normalize_windsurf_path_for_config(&detected);
+    if current.windsurf_app_path != normalized {
+        let path = normalized.clone();
+        if let Err(err) = modules::config::patch_user_config(move |config| {
+            if force || normalize_custom_path(&config.windsurf_app_path).is_none() {
+                config.windsurf_app_path = path;
+            }
+            Ok(())
+        }) {
+            modules::logger::log_warn(&format!("保存 Windsurf 启动路径失败（已忽略）: {}", err));
+        }
+    }
+    Some(normalized)
+}
+
+fn resolve_windsurf_launch_path() -> Result<PathBuf, String> {
+    let config = modules::config::get_user_config();
+    if let Some(custom) = normalize_custom_path(&config.windsurf_app_path) {
+        if let Some(exec) = resolve_macos_exec_path(&custom) {
+            if path_looks_like_windsurf(&exec) {
+                return Ok(exec);
+            }
+            modules::logger::log_warn(&format!(
+                "忽略非 Windsurf 启动路径配置: {}",
+                exec.to_string_lossy()
+            ));
+        }
+        return Err("APP_PATH_NOT_FOUND:windsurf".to_string());
+    }
+
+    Err("APP_PATH_NOT_FOUND:windsurf".to_string())
+}
+
+pub fn ensure_windsurf_launch_path_configured() -> Result<(), String> {
+    resolve_windsurf_launch_path().map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+fn sanitize_macos_gui_launch_env(cmd: &mut Command) {
+    // Avoid inheriting Cockpit bundle identity into child GUI apps.
+    cmd.env_remove("__CFBundleIdentifier");
+    cmd.env_remove("XPC_SERVICE_NAME");
+}
+
+#[cfg(target_os = "linux")]
+fn sanitize_macos_gui_launch_env(_cmd: &mut Command) {}
+
+#[cfg(target_os = "windows")]
+fn spawn_windsurf_windows(
+    launch_path: &Path,
+    user_data_dir: &str,
+    extra_args: &[String],
+    use_new_window: bool,
+) -> Result<u32, String> {
+    use std::os::windows::process::CommandExt;
+
+    let mut cmd = Command::new(launch_path);
+    cmd.creation_flags(0x08000000);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd.arg("--user-data-dir").arg(user_data_dir.trim());
+    if use_new_window {
+        cmd.arg("--new-window");
+    } else {
+        cmd.arg("--reuse-window");
+    }
+    for arg in extra_args {
+        if !arg.trim().is_empty() {
+            cmd.arg(arg.trim());
+        }
+    }
+    let child =
+        spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Windsurf 失败: {}", e))?;
+    Ok(child.id())
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_windsurf_macos_open(
+    launch_path: &Path,
+    user_data_dir: &str,
+    extra_args: &[String],
+    use_new_window: bool,
+) -> Result<u32, String> {
+    let app_root = normalize_macos_app_root(launch_path).ok_or("APP_PATH_NOT_FOUND:windsurf")?;
+    let target = user_data_dir.trim();
+
+    let mut cmd = Command::new("open");
+    sanitize_macos_gui_launch_env(&mut cmd);
+    if use_new_window {
+        cmd.arg("-n");
+    }
+    cmd.arg("-a").arg(&app_root);
+    cmd.arg("--args");
+    cmd.arg("--user-data-dir").arg(target);
+    if use_new_window {
+        cmd.arg("--new-window");
+    } else {
+        cmd.arg("--reuse-window");
+    }
+    for arg in extra_args {
+        if !arg.trim().is_empty() {
+            cmd.arg(arg.trim());
+        }
+    }
+
+    let child =
+        spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Windsurf 失败: {}", e))?;
+    modules::logger::log_info(if use_new_window {
+        "Windsurf 启动命令已发送（open -n -a）"
+    } else {
+        "Windsurf 启动命令已发送（open -a，复用窗口）"
+    });
+    let probe_started = std::time::Instant::now();
+    let timeout = std::time::Duration::from_secs(6);
+    while probe_started.elapsed() < timeout {
+        if let Some(resolved_pid) = resolve_windsurf_pid(None, Some(target)) {
+            return Ok(resolved_pid);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    modules::logger::log_warn(&format!(
+        "[Windsurf Start] 启动后 6s 内未匹配到实例 PID，回退 open pid={}",
+        child.id()
+    ));
+    Ok(child.id())
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_windsurf_unix(
+    launch_path: &Path,
+    user_data_dir: &str,
+    extra_args: &[String],
+    use_new_window: bool,
+) -> Result<u32, String> {
+    let mut cmd = Command::new(launch_path);
+    sanitize_macos_gui_launch_env(&mut cmd);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd.arg("--user-data-dir").arg(user_data_dir.trim());
+    if use_new_window {
+        cmd.arg("--new-window");
+    } else {
+        cmd.arg("--reuse-window");
+    }
+    for arg in extra_args {
+        if !arg.trim().is_empty() {
+            cmd.arg(arg.trim());
+        }
+    }
+    let child =
+        spawn_command_with_trace(&mut cmd).map_err(|e| format!("启动 Windsurf 失败: {}", e))?;
+    Ok(child.id())
+}
+
+pub fn start_windsurf_with_args_with_new_window(
+    user_data_dir: &str,
+    extra_args: &[String],
+    use_new_window: bool,
+) -> Result<u32, String> {
+    let target = user_data_dir.trim();
+    if target.is_empty() {
+        return Err("实例目录为空，无法启动".to_string());
+    }
+    let launch_path = resolve_windsurf_launch_path()?;
+    #[cfg(target_os = "windows")]
+    {
+        return spawn_windsurf_windows(&launch_path, target, extra_args, use_new_window);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return spawn_windsurf_macos_open(&launch_path, target, extra_args, use_new_window);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return spawn_windsurf_unix(&launch_path, target, extra_args, use_new_window);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (target, extra_args, use_new_window);
+        Err("Windsurf 应用多开仅支持 macOS、Windows 和 Linux".to_string())
+    }
+}
+
+pub fn start_windsurf_default_with_args_with_new_window(
+    extra_args: &[String],
+    use_new_window: bool,
+) -> Result<u32, String> {
+    let default_dir = get_default_windsurf_user_data_dir()?;
+    start_windsurf_with_args_with_new_window(
+        &default_dir.to_string_lossy(),
+        extra_args,
+        use_new_window,
+    )
+}
+
+fn resolve_windsurf_entry_user_data_dir_for_matching(
+    dir: Option<&String>,
+    default_dir: Option<&str>,
+) -> Option<String> {
+    dir.and_then(|value| normalize_non_empty_path(Some(value.as_str())))
+        .or_else(|| default_dir.and_then(|value| normalize_non_empty_path(Some(value))))
+}
+
+fn windsurf_entry_matches_target_dirs(
+    dir: Option<&String>,
+    target_dirs: &HashSet<String>,
+    default_dir: Option<&str>,
+) -> bool {
+    resolve_windsurf_entry_user_data_dir_for_matching(dir, default_dir)
+        .map(|value| target_dirs.contains(&value))
+        .unwrap_or(false)
+}
+
+fn select_windsurf_main_pids_by_target_dirs(
+    entries: &[(u32, Option<String>)],
+    target_dirs: &HashSet<String>,
+    default_dir: Option<&str>,
+) -> Vec<u32> {
+    entries
+        .iter()
+        .filter_map(|(pid, dir)| {
+            windsurf_entry_matches_target_dirs(dir.as_ref(), target_dirs, default_dir)
+                .then_some(*pid)
+        })
+        .collect()
+}
+
+fn filter_windsurf_entries_by_target_dirs(
+    entries: Vec<(u32, Option<String>)>,
+    target_dirs: &HashSet<String>,
+    default_dir: Option<&str>,
+) -> Vec<(u32, Option<String>)> {
+    entries
+        .into_iter()
+        .filter(|(_, dir)| {
+            windsurf_entry_matches_target_dirs(dir.as_ref(), target_dirs, default_dir)
+        })
+        .collect()
+}
+
+fn collect_windsurf_remaining_pids(entries: &[(u32, Option<String>)]) -> Vec<u32> {
+    let mut pids: Vec<u32> = entries.iter().map(|(pid, _)| *pid).collect();
+    pids.sort();
+    pids.dedup();
+    pids
+}
+
+fn wait_windsurf_pids_exit(pids: &[u32], timeout_secs: u64) -> bool {
+    if pids.is_empty() {
+        return true;
+    }
+    let start = std::time::Instant::now();
+    loop {
+        let any_alive = pids
+            .iter()
+            .any(|pid| *pid != 0 && modules::process::is_pid_running(*pid));
+        if !any_alive {
+            return true;
+        }
+        if start.elapsed() >= std::time::Duration::from_secs(timeout_secs) {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(350));
+    }
+}
+
+fn request_windsurf_graceful_close(pid: u32) {
+    if pid == 0 || !modules::process::is_pid_running(pid) {
+        return;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "tell application \"System Events\" to set frontmost of (first process whose unix id is {}) to true\n\
+tell application \"System Events\" to keystroke \"q\" using command down",
+            pid
+        );
+        match Command::new("osascript").args(["-e", &script]).output() {
+            Ok(output) => {
+                if output.status.success() {
+                    modules::logger::log_info(&format!(
+                        "[Windsurf Close] 已发送优雅退出请求 pid={}",
+                        pid
+                    ));
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    modules::logger::log_warn(&format!(
+                        "[Windsurf Close] 优雅退出失败 pid={} err={}",
+                        pid,
+                        stderr.trim()
+                    ));
+                }
+            }
+            Err(err) => {
+                modules::logger::log_warn(&format!(
+                    "[Windsurf Close] 调用 osascript 失败 pid={} err={}",
+                    pid, err
+                ));
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        modules::logger::log_info(&format!(
+            "[Windsurf Close] graceful taskkill start pid={}",
+            pid
+        ));
+        let output = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T"])
+            .creation_flags(0x08000000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        match output {
+            Ok(value) => {
+                if value.status.success() {
+                    modules::logger::log_info(&format!(
+                        "[Windsurf Close] graceful taskkill success pid={} status={}",
+                        pid, value.status
+                    ));
+                } else {
+                    modules::logger::log_warn(&format!(
+                        "[Windsurf Close] graceful taskkill failed pid={} status={}",
+                        pid, value.status
+                    ));
+                }
+            }
+            Err(err) => {
+                modules::logger::log_warn(&format!(
+                    "[Windsurf Close] graceful taskkill error pid={} err={}",
+                    pid, err
+                ));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = Command::new("kill")
+            .args(["-15", &pid.to_string()])
+            .output();
+    }
+}
+
+pub fn close_windsurf(user_data_dirs: &[String], timeout_secs: u64) -> Result<(), String> {
+    modules::logger::log_info("正在关闭受管 Windsurf 实例...");
+    let target_dirs: HashSet<String> = user_data_dirs
+        .iter()
+        .map(|value| normalize_path_for_compare(value))
+        .filter(|value| !value.is_empty())
+        .collect();
+    if target_dirs.is_empty() {
+        modules::logger::log_info("未提供可关闭的 Windsurf 实例目录");
+        return Ok(());
+    }
+    let default_dir = get_default_windsurf_user_data_dir()
+        .ok()
+        .map(|value| normalize_path_for_compare(&value.to_string_lossy()))
+        .filter(|value| !value.is_empty());
+    modules::logger::log_info(&format!(
+        "[Windsurf Close] default_dir={}",
+        default_dir
+            .as_deref()
+            .map(|value| modules::process::summarize_text_for_process_log(value, 96))
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    let entries = collect_windsurf_process_entries();
+    let mut pids =
+        select_windsurf_main_pids_by_target_dirs(&entries, &target_dirs, default_dir.as_deref());
+    pids.sort();
+    pids.dedup();
+    if pids.is_empty() {
+        modules::logger::log_info("受管 Windsurf 实例未在运行，无需关闭");
+        return Ok(());
+    }
+    modules::logger::log_info(&format!(
+        "[Windsurf Close] matched_main_pids={}",
+        modules::process::summarize_pid_list_for_log(&pids)
+    ));
+
+    for pid in &pids {
+        request_windsurf_graceful_close(*pid);
+    }
+    if wait_windsurf_pids_exit(&pids, 2) {
+        modules::logger::log_info(&format!(
+            "[Windsurf Close] graceful close finished, targets={}",
+            modules::process::summarize_pid_list_for_log(&pids)
+        ));
+        return Ok(());
+    }
+
+    for pid in &pids {
+        if let Err(err) = modules::process::close_pid(*pid, timeout_secs) {
+            modules::logger::log_warn(&format!(
+                "[Windsurf Close] close_pid returned error pid={} err={}",
+                pid, err
+            ));
+        }
+    }
+
+    let mut remaining_entries = filter_windsurf_entries_by_target_dirs(
+        collect_windsurf_process_entries(),
+        &target_dirs,
+        default_dir.as_deref(),
+    );
+    if !remaining_entries.is_empty() {
+        let remaining_pids = collect_windsurf_remaining_pids(&remaining_entries);
+        modules::logger::log_warn(&format!(
+            "[Windsurf Close] first remaining pids after close={}",
+            modules::process::summarize_pid_list_for_log(&remaining_pids)
+        ));
+        for pid in &remaining_pids {
+            if let Err(err) = modules::process::close_pid(*pid, 6) {
+                modules::logger::log_warn(&format!(
+                    "[Windsurf Close] retry close_pid returned error pid={} err={}",
+                    pid, err
+                ));
+            }
+        }
+        remaining_entries = filter_windsurf_entries_by_target_dirs(
+            collect_windsurf_process_entries(),
+            &target_dirs,
+            default_dir.as_deref(),
+        );
+    }
+
+    if !remaining_entries.is_empty() {
+        let remaining_pids = collect_windsurf_remaining_pids(&remaining_entries);
+        return Err(format!(
+            "无法关闭受管 Windsurf 实例进程，请手动关闭后重试: {}",
+            modules::process::summarize_pid_list_for_log(&remaining_pids)
+        ));
+    }
+
+    Ok(())
+}
+
+fn ensure_profile_global_storage(profile_dir: &Path) -> Result<PathBuf, String> {
+    let global_storage = profile_dir.join("User").join("globalStorage");
+    if !global_storage.exists() {
+        fs::create_dir_all(&global_storage)
+            .map_err(|e| format!("创建 globalStorage 失败: {}", e))?;
+    }
+    Ok(global_storage)
+}
+
+fn ensure_state_db_for_injection(profile_dir: &Path) -> Result<PathBuf, String> {
+    let db_path = profile_dir
+        .join("User")
+        .join("globalStorage")
+        .join("state.vscdb");
+    if db_path.exists() {
+        return Ok(db_path);
+    }
+
+    // 遍历 Devin/Windsurf 候选目录，按 installationId/登录态评分挑选复制源，
+    // 避免只读旧 Windsurf 路径，或误复制空的新 Devin DB。
+    let candidates = windsurf_user_data_dir_candidates()?;
+    let source_dir = pick_preferred_windsurf_user_data_dir(&candidates);
+    let source_db = state_db_under_user_data_dir(&source_dir);
+
+    if source_db.is_file() {
+        let _ = ensure_profile_global_storage(profile_dir)?;
+        fs::copy(&source_db, &db_path).map_err(|e| format!("复制 state.vscdb 失败: {}", e))?;
+    }
+
+    if !db_path.exists() {
+        return Err("未找到 state.vscdb，请先勾选复制当前登录状态或先启动实例一次".to_string());
+    }
+
+    let default_storage = source_dir
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+    let target_storage = profile_dir
+        .join("User")
+        .join("globalStorage")
+        .join("storage.json");
+    if default_storage.exists() && !target_storage.exists() {
+        let _ = fs::copy(&default_storage, &target_storage);
+    }
+
+    Ok(db_path)
+}
+
+pub fn inject_account_to_profile(profile_dir: &Path, account_id: &str) -> Result<(), String> {
+    let account = windsurf_account::load_account(account_id)
+        .ok_or_else(|| format!("绑定账号不存在: {}", account_id))?;
+    let db_path = ensure_state_db_for_injection(profile_dir)?;
+    let conn = Connection::open(&db_path).map_err(|e| format!("打开数据库失败: {}", e))?;
+
+    let mut auth_status = account
+        .windsurf_auth_status_raw
+        .clone()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !auth_status.is_object() {
+        auth_status = serde_json::json!({});
+    }
+
+    let access_token = resolve_account_session_access_token(&account)
+        .ok_or_else(|| "账号缺少 Windsurf 可用 token，无法注入本地配置".to_string())?;
+    let is_auth1_token = access_token.starts_with("devin-session-token$");
+    let api_key = if is_auth1_token {
+        access_token.clone()
+    } else {
+        resolve_account_api_key(&account)
+            .ok_or_else(|| "账号缺少 Windsurf apiKey，无法注入本地配置".to_string())?
+    };
+    let api_server_url = resolve_account_api_server_url(&account, &auth_status);
+    let account_label = resolve_account_label(&account, &auth_status);
+
+    if let Some(obj) = auth_status.as_object_mut() {
+        obj.insert("apiKey".to_string(), Value::String(api_key.clone()));
+        let display_name = normalize_non_empty_text(account.github_name.as_deref())
+            .unwrap_or_else(|| account_label.clone());
+        let display_email = normalize_non_empty_text(account.github_email.as_deref());
+        obj.insert("name".to_string(), Value::String(display_name.clone()));
+        if let Some(email) = display_email.clone() {
+            obj.insert("email".to_string(), Value::String(email));
+        }
+        obj.insert(
+            "apiServerUrl".to_string(),
+            Value::String(api_server_url.clone()),
+        );
+        // 关键: IDE 通过 status="SignedIn" 判断已登录，缺这个字段会显示未登录
+        obj.insert("status".to_string(), Value::String("SignedIn".to_string()));
+        // 关键: IDE 头像旁边显示用户名/邮箱靠这个嵌套对象
+        let mut user_obj = serde_json::Map::new();
+        user_obj.insert("name".to_string(), Value::String(display_name));
+        user_obj.insert(
+            "email".to_string(),
+            display_email
+                .as_ref()
+                .map(|e| Value::String(e.clone()))
+                .unwrap_or(Value::Null),
+        );
+        obj.insert("user".to_string(), Value::Object(user_obj));
+        // 时间戳标记本次切号
+        obj.insert(
+            "timestamp".to_string(),
+            Value::Number(serde_json::Number::from(Utc::now().timestamp_millis())),
+        );
+        if is_auth1_token {
+            obj.insert(
+                "sessionToken".to_string(),
+                Value::String(access_token.clone()),
+            );
+            obj.insert("authMethod".to_string(), Value::String("auth1".to_string()));
+            // Devin 账号: 写入 UserStatus protobuf 让 IDE 启动时 UI 显示信息完整
+            // (账号名/邮箱/计划状态等都从这个 proto 解出来)
+            if let Some(proto_b64) = account
+                .devin_user_status_proto_b64
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                obj.insert(
+                    "userStatusProtoBinaryBase64".to_string(),
+                    Value::String(proto_b64.to_string()),
+                );
+            }
+            // 同时把 account_id / org_id 也塞进去，IDE 启动时可能会读
+            if let Some(account_id) = account
+                .devin_account_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                obj.insert(
+                    "accountId".to_string(),
+                    Value::String(account_id.to_string()),
+                );
+            }
+            if let Some(org_id) = account
+                .devin_org_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                obj.insert(
+                    "primaryOrgId".to_string(),
+                    Value::String(org_id.to_string()),
+                );
+            }
+        }
+    }
+
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|e| format!("无法开始登录态事务: {}", e))?;
+    write_windsurf_auth_data(
+        &transaction,
+        profile_dir,
+        &auth_status,
+        &account_label,
+        &access_token,
+        &api_server_url,
+    )?;
+
+    transaction
+        .commit()
+        .map_err(|e| format!("无法提交登录态事务: {}", e))?;
+    Ok(())
+}
+
+/// Read the official client's own encrypted session after its deep-link handler
+/// has finished. The browser callback stays owned by Devin Desktop.
+#[cfg(target_os = "windows")]
+pub fn read_profile_session_auth_status(profile_dir: &Path) -> Result<Option<Value>, String> {
+    let db = state_db_under_user_data_dir(profile_dir);
+    if !db.is_file() {
+        return Ok(None);
+    }
+    let conn = Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|_| "无法读取官方客户端会话数据库，请稍后再试")?;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key=?1",
+            [WINDSURF_SESSIONS_SECRET_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| "无法读取官方客户端加密会话")?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.trim() == "null" {
+        return Ok(None);
+    }
+    let decode = |raw: &str| -> Result<Vec<u8>, String> {
+        let value: Value = serde_json::from_str(raw).map_err(|_| "官方客户端会话格式无法解析")?;
+        let bytes = decode_buffer_data(&value)?;
+        if bytes.len() < 31 || !bytes.starts_with(V10_PREFIX) {
+            return Err("不支持当前官方客户端的会话加密格式，请使用手动导入".into());
+        }
+        let key = get_windows_encryption_key(profile_dir)?;
+        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "客户端会话密钥格式无效")?;
+        cipher
+            .decrypt(aes_gcm::Nonce::from_slice(&bytes[3..15]), &bytes[15..])
+            .map_err(|_| "无法解密官方客户端会话，请使用当前 Windows 用户登录".to_string())
+    };
+    let sessions: Value =
+        serde_json::from_slice(&decode(&raw)?).map_err(|_| "官方客户端登录会话无法解析")?;
+    let Some(session) = sessions.as_array().and_then(|s| s.first()) else {
+        return Ok(None);
+    };
+    let Some(token) = session
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    let server: Option<String> = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key=?1",
+            [WINDSURF_API_SERVER_SECRET_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| "读取客户端服务地址失败")?;
+    let server = server
+        .as_deref()
+        .map(decode)
+        .transpose()?
+        .and_then(|s| String::from_utf8(s).ok())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            if token.starts_with("devin-session-token$") {
+                "https://server.self-serve.windsurf.com".into()
+            } else {
+                WINDSURF_DEFAULT_API_SERVER_URL.into()
+            }
+        });
+    let label = session
+        .pointer("/account/label")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let mut auth =
+        serde_json::json!({"apiKey":token,"apiServerUrl":server,"name":label,"status":"SignedIn"});
+    if let Some(id) = session.get("id").and_then(Value::as_str) {
+        auth["_switcherDesktopSessionId"] = Value::String(id.into());
+    }
+    if token.starts_with("devin-session-token$") {
+        auth["sessionToken"] = Value::String(token.into());
+        auth["authMethod"] = Value::String("auth1".into());
+    }
+    if label.contains('@') {
+        auth["email"] = Value::String(label.into());
+    }
+    Ok(Some(auth))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pick_preferred_windsurf_user_data_dir, state_db_under_user_data_dir};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cockpit-windsurf-test-{}-{}", name, nanos));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn pick_prefers_state_db_over_empty_devin_dir() {
+        let root = temp_dir("prefer-state");
+        let devin = root.join("Devin");
+        let windsurf = root.join("Windsurf");
+        fs::create_dir_all(&devin).unwrap();
+        fs::create_dir_all(state_db_under_user_data_dir(&windsurf).parent().unwrap()).unwrap();
+        // 写入最小可用 sqlite，state_db_score 至少 > 0
+        let db = state_db_under_user_data_dir(&windsurf);
+        {
+            use rusqlite::Connection;
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE ItemTable (key TEXT, value BLOB);
+                 INSERT INTO ItemTable VALUES ('codeium.windsurf', '{\"codeium.installationId\":\"id-1\"}');",
+            )
+            .unwrap();
+        }
+
+        let picked = pick_preferred_windsurf_user_data_dir(&[devin.clone(), windsurf.clone()]);
+        assert_eq!(picked, windsurf);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pick_prefers_existing_devin_dir_when_no_state_db() {
+        let root = temp_dir("prefer-devin-dir");
+        let devin = root.join("Devin");
+        let windsurf = root.join("Windsurf");
+        fs::create_dir_all(&devin).unwrap();
+        // windsurf path does not exist
+
+        let picked = pick_preferred_windsurf_user_data_dir(&[devin.clone(), windsurf.clone()]);
+        assert_eq!(picked, devin);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pick_falls_back_to_first_candidate_when_none_exist() {
+        let root = temp_dir("fallback");
+        let devin = root.join("Devin");
+        let windsurf = root.join("Windsurf");
+        let picked = pick_preferred_windsurf_user_data_dir(&[devin.clone(), windsurf]);
+        assert_eq!(picked, devin);
+        let _ = fs::remove_dir_all(root);
+    }
+}

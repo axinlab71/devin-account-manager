@@ -1,0 +1,74 @@
+// Local UI regression with synthetic IPC fixtures; never reads real account data.
+const { chromium } = require(process.env.DEVIN_PLAYWRIGHT_PATH || 'playwright');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+(async () => {
+ const browser = await chromium.launch({ channel: 'msedge', headless: true });
+ const page = await browser.newPage({ viewport: { width:1120, height:780 }, reducedMotion: 'reduce' });
+ const errors = []; page.on('pageerror', e => errors.push(e.message));
+ await page.addInitScript(() => {
+  if (!localStorage.getItem('devin.view')) localStorage.setItem('devin.view','grid');
+  if (!localStorage.getItem('devin.theme')) localStorage.setItem('devin.theme','light');
+  const now = Math.floor(Date.now()/1000);
+  const account = (id,name,email,plan,days) => ({id,github_name:name,github_login:email,github_email:email,github_id:0,github_access_token:'synthetic-ui-only',copilot_token:'synthetic-ui-only',copilot_plan:plan,created_at:now-days*86400,last_used:now-days*3600});
+  window.uiFixture = { accounts:[account('demo-1','Alex Chen','alex@example.com','Pro',1), account('demo-2','Design Studio','design@example.com','Teams',3), {...account('demo-3','Personal','personal@example.com','Free',5),quota_query_last_error:'synthetic expired'}],calls:[] };
+  window.__TAURI_INTERNALS__ = { invoke: async (cmd,args) => {
+   const f=window.uiFixture; f.calls.push(cmd);
+   if(cmd==='list_windsurf_accounts')return [...f.accounts];
+   if(cmd==='get_client_status')return {installed:true,appPath:'E:\\Devin\\Devin.exe',currentAccountId:'demo-2',dataDir:'Synthetic UI fixture'};
+   if(cmd==='refresh_windsurf_token') {if(args.accountId==='demo-3') throw new Error('Synthetic refresh failure');return f.accounts.find(a=>a.id===args.accountId);}
+   if(cmd==='windsurf_oauth_login_start')return {loginId:'synthetic-login',expiresIn:30};
+   if(cmd==='windsurf_oauth_login_poll')return null;
+   if(cmd==='windsurf_oauth_login_cancel')return;
+   if(cmd==='delete_windsurf_account'){f.accounts=f.accounts.filter(a=>a.id!==args.accountId);return;}
+   throw new Error('Unexpected mock command: '+cmd);
+  }};
+ });
+ await page.goto('http://127.0.0.1:1420');
+ await page.locator('.account').first().waitFor();
+ assert.equal(await page.locator('.account').count(),3);
+ assert.match(await page.locator('.account').first().innerText(), /Design Studio/);
+ await page.screenshot({path:'docs/ui-0.1.4-light.png',fullPage:true});
+ await page.getByRole('textbox',{name:'搜索账号'}).fill('alex@');assert.equal(await page.locator('.account').count(),1);
+ await page.getByRole('button',{name:'清空搜索'}).click();
+ await page.getByRole('combobox',{name:'筛选账号'}).selectOption('attention');assert.equal(await page.locator('.account').count(),1);
+ await page.getByRole('combobox',{name:'筛选账号'}).selectOption('all');
+ await page.getByRole('button',{name:'隐藏账号信息'}).click();assert.equal(await page.locator('.account').filter({hasText:'alex@example.com'}).count(),0);
+ await page.getByRole('button',{name:'显示账号信息'}).click();
+ await page.getByRole('button',{name:'列表视图',exact:true}).click(); assert.equal(await page.locator('.accounts.list').count(),1);
+ await page.getByRole('button',{name:'切换深色主题'}).click();await page.screenshot({path:'docs/ui-0.1.4-dark-list.png',fullPage:true});
+ await page.getByRole('button',{name:'添加账号',exact:true}).click();
+ assert.equal(await page.getByRole('dialog').count(),1);
+ await page.keyboard.press('Shift+Tab');
+ assert.equal(await page.evaluate(()=>document.activeElement.textContent.includes('导入本机账号')),true);
+ await page.keyboard.press('Tab');
+ assert.equal(await page.evaluate(()=>document.activeElement.getAttribute('aria-label')),'关闭弹窗');
+ await page.screenshot({path:'docs/ui-0.1.4-auth.png',fullPage:true});
+ await page.getByRole('button',{name:'开始网页授权',exact:true}).click();
+ await page.getByRole('button',{name:'取消本次授权'}).waitFor();
+ assert.equal(await page.getByRole('button',{name:'关闭弹窗'}).isDisabled(),true);
+ await page.getByRole('button',{name:'取消本次授权'}).click();
+ await page.getByRole('button',{name:'开始网页授权',exact:true}).waitFor({state:'visible'});
+ await page.waitForFunction(()=>!document.querySelector('button[aria-label="关闭弹窗"]').disabled);
+ await page.getByRole('tab',{name:'Token 导入'}).click();assert.equal(await page.getByRole('textbox',{name:'登录凭据'}).count(),1);
+ await page.getByRole('tab',{name:'JSON 导入'}).click();assert.equal(await page.getByRole('textbox',{name:'账号 JSON'}).count(),1);
+ await page.keyboard.press('Escape');assert.equal(await page.getByRole('dialog').count(),0);
+ await page.getByRole('button',{name:'刷新全部',exact:true}).click();
+ await page.getByText('刷新结束：2 个完成，1 个需检查，可在对应账号上单独重试。',{exact:true}).waitFor();
+ await page.getByRole('button',{name:'删除 Personal',exact:true}).click();
+ await page.getByRole('button',{name:'保留账号'}).click();assert.equal(await page.locator('.account').count(),3);
+ await page.getByRole('button',{name:'删除 Personal',exact:true}).click();await page.getByRole('button',{name:'确认删除'}).click();await page.waitForFunction(()=>document.querySelectorAll('.account').length===2);
+ await page.getByRole('button',{name:'切换浅色主题'}).click();await page.getByRole('button',{name:'网格视图',exact:true}).click();
+ await page.setViewportSize({width:720,height:560});
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+ await page.screenshot({path:'docs/ui-0.1.4-compact.png',fullPage:true});
+ await page.getByRole('button',{name:'添加账号',exact:true}).click();
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+ await page.keyboard.press('Escape');
+ await page.reload();await page.locator('.account').first().waitFor();
+ assert.equal(await page.locator('.accounts.grid').count(),1);
+ assert.equal(await page.locator('html').getAttribute('data-theme'),'light');
+ assert.deepEqual(errors,[]);
+ console.log('PASS: 3 synthetic accounts; current-first; search; filters; privacy; grid/list; theme + preference persistence; auth waiting/cancel; Token/JSON tabs; Escape; partial refresh; delete cancel/confirm; 720px responsive; zero browser exceptions.');
+ await browser.close();
+})().catch(e=>{console.error(e);process.exit(1)});

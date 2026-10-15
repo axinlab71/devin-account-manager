@@ -1,0 +1,22 @@
+node_modules/
+dist/
+src-tauri/target/
+*.log
+
+# Local credentials, account state and diagnostics
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+oauth_pending/
+client-backups/
+accounts/
+logs/
+*.log
+docs/*-output*.txt
+docs/network-probe*.txt

@@ -1,0 +1,37 @@
+{
+  "source_client": "E:/Devin/Devin.exe",
+  "source_icon": "E:/Devin/resources/app/resources/win32/code.ico",
+  "icon_sha256": "c88906cefc84b4f071de7bd97329303c8589f51142b449a57b24489bd8689eb9",
+  "theme_sources": [
+    {
+      "source": "E:\\Devin\\resources\\app\\extensions\\theme-windsurf\\themes\\windsurf-dark.json",
+      "sha256": "2f932e072a67d28f288e3c2426762fc8e47ae264f40e26452c840b4a8612c29d",
+      "tokens": {
+        "editor.background": "#141414",
+        "sideBar.background": "#191919",
+        "foreground": "#ffffffe6",
+        "descriptionForeground": "#ffffff85",
+        "button.background": "#4489ff",
+        "button.foreground": "#ffffff",
+        "input.background": "#2a2a2a",
+        "input.border": "#ffffff0a",
+        "focusBorder": "#49b0ff"
+      }
+    },
+    {
+      "source": "E:\\Devin\\resources\\app\\extensions\\theme-windsurf\\themes\\windsurf-light.json",
+      "sha256": "898a6ac8edbd15d2dcb15198db8c94c8e7f4f78723775ade11e92e357ba974cf",
+      "tokens": {
+        "editor.background": "#fcfcfc",
+        "sideBar.background": "#f8f8f8",
+        "foreground": "#191919",
+        "descriptionForeground": "#1919198f",
+        "button.background": "#317cff",
+        "button.foreground": "#ffffff",
+        "input.background": "#ffffff",
+        "input.border": "#00000014",
+        "focusBorder": "#317cff"
+      }
+    }
+  ]
+}

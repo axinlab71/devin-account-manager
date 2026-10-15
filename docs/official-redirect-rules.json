@@ -1,0 +1,27 @@
+{
+  "source": "https://windsurf.com/_next/static/chunks/51107-91955e0efb5a8323.js",
+  "sha256": "5be820f4a9f5075469d150266b3b890f309ed635bcf07941824107f053dedb4d",
+  "result": [
+    {
+      "uri": "http://127.0.0.1:63183/windsurf-auth-callback",
+      "localManualLoginBranch": false,
+      "allowedByWebRedirectValidator": true
+    },
+    {
+      "uri": "http://127.0.0.1:63183/auth",
+      "localManualLoginBranch": true,
+      "allowedByWebRedirectValidator": true
+    },
+    {
+      "uri": "http://localhost:63183/auth",
+      "localManualLoginBranch": true,
+      "allowedByWebRedirectValidator": true
+    },
+    {
+      "uri": "devin://codeium.windsurf",
+      "localManualLoginBranch": false,
+      "allowedByWebRedirectValidator": true
+    }
+  ],
+  "note": "Static frontend validation only; does not prove authenticated server acceptance."
+}

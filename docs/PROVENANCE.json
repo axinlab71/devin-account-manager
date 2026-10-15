@@ -1,0 +1,134 @@
+{
+  "repository": "https://github.com/jlcodes99/cockpit-tools",
+  "commit": "915e7a20b432546660c3cd15e90f9fa527490ecc",
+  "files": [
+    {
+      "source": "src-tauri/src/modules/windsurf_oauth.rs",
+      "target": "src-tauri/src/modules/windsurf_oauth.rs",
+      "source_sha256": "924a89a97450f650415022c7f109b6b4ed534e6dd238db16633d58bea82a2ebc",
+      "final_sha256": "e3964422be6708591bd1172e17b55605e89fc7263755fe5cc38744c9e71473d2",
+      "modified": true
+    },
+    {
+      "source": "src-tauri/src/modules/windsurf_devin_oauth.rs",
+      "target": "src-tauri/src/modules/windsurf_devin_oauth.rs",
+      "source_sha256": "2200e24d4571fa66553ab992c324188c1b3e553d2481ffc1b26ca8738543417c",
+      "final_sha256": "5537b363e2fa4fd04a5d00cee20ff23f85663f6470dbd471ab8d46d6dd0d13bd",
+      "modified": true
+    },
+    {
+      "source": "src-tauri/src/modules/windsurf_account.rs",
+      "target": "src-tauri/src/modules/windsurf_account.rs",
+      "source_sha256": "6708dac258b054458f9acb2d161c75ab7d494effa100ff17b34d4fcfbfc2a2bc",
+      "final_sha256": "b13f3ca7f1bc886575199d5fae2cd95cf36cce6b2d553685c726ac68a929421e",
+      "modified": true
+    },
+    {
+      "source": "src-tauri/src/modules/windsurf_instance.rs",
+      "target": "src-tauri/src/modules/windsurf_instance.rs",
+      "source_sha256": "7b5108cebe863732d69d8a6367387709ea6e3222c22156d173679440813f83ee",
+      "final_sha256": "ed2c8dcebcd85bad4608052897ca0a224b6553176845bbbd1f0b7a9de2a645f8",
+      "modified": true
+    },
+    {
+      "source": "src-tauri/src/modules/secure_account_storage.rs",
+      "target": "src-tauri/src/modules/secure_account_storage.rs",
+      "source_sha256": "adc5b49f8d8ddadd87ee4b31c00b8d0bb9939fde307011966c0c49aa42b9c642",
+      "final_sha256": "dc738f74c509dec6cd753bdc86e27561a81bb1667cfa4e875fcaa2edec787aae",
+      "modified": true
+    },
+    {
+      "source": "src-tauri/src/modules/atomic_write.rs",
+      "target": "src-tauri/src/modules/atomic_write.rs",
+      "source_sha256": "8fc905ea5095a5a65ee10735fa1d36490a4989a26143ea0663251a637143ab6e",
+      "final_sha256": "21aa7e504a79d8b21088d3509e68a092d4ddc80453285d4718172942fb52b904",
+      "modified": true
+    },
+    {
+      "source": "src-tauri/src/modules/account_index_repair.rs",
+      "target": "src-tauri/src/modules/account_index_repair.rs",
+      "source_sha256": "28ae0e879bb8dc4f6907a8fdd121e31fdf7af5a5b7b9341da2ee902453db4232",
+      "final_sha256": "28ae0e879bb8dc4f6907a8fdd121e31fdf7af5a5b7b9341da2ee902453db4232",
+      "modified": false
+    },
+    {
+      "source": "src-tauri/src/modules/deferred_account_rewrite.rs",
+      "target": "src-tauri/src/modules/deferred_account_rewrite.rs",
+      "source_sha256": "ae5267a44e710635ebfbf34a5cc6c69fdfecbdd8702f5a9eace93516f768bcea",
+      "final_sha256": "ae5267a44e710635ebfbf34a5cc6c69fdfecbdd8702f5a9eace93516f768bcea",
+      "modified": false
+    },
+    {
+      "source": "src-tauri/src/modules/client_version.rs",
+      "target": "src-tauri/src/modules/client_version.rs",
+      "source_sha256": "2d485432766f722f1a3a6befa5148d2d4a919c67d049c2fffe6188a64d2364d5",
+      "final_sha256": "2d485432766f722f1a3a6befa5148d2d4a919c67d049c2fffe6188a64d2364d5",
+      "modified": false
+    },
+    {
+      "source": "src-tauri/src/modules/oauth_pending_state.rs",
+      "target": "src-tauri/src/modules/oauth_pending_state.rs",
+      "source_sha256": "cda6ff76abb9ab4ba68086dd9656252f081be842c7a7cd6f0fba6ed39e90fc94",
+      "final_sha256": "cda6ff76abb9ab4ba68086dd9656252f081be842c7a7cd6f0fba6ed39e90fc94",
+      "modified": false
+    },
+    {
+      "source": "src-tauri/src/modules/windows_operation.rs",
+      "target": "src-tauri/src/modules/windows_operation.rs",
+      "source_sha256": "a7c32cd09725b8aee789abdd7566674fa01a5b614a4017034de11cc3d2bbc3af",
+      "final_sha256": "3bf70ec52adb17a9a32cb91b336cb2bcd47d6f737283b552ccb961e8720ea661",
+      "modified": true
+    },
+    {
+      "source": "src-tauri/src/models/windsurf.rs",
+      "target": "src-tauri/src/models/windsurf.rs",
+      "source_sha256": "69a92c48f54f7619ab2ea88e31b3a9584325e530ce25324dc9e7ce833a48efda",
+      "final_sha256": "69a92c48f54f7619ab2ea88e31b3a9584325e530ce25324dc9e7ce833a48efda",
+      "modified": false
+    },
+    {
+      "source": "src-tauri/src/utils/protobuf.rs",
+      "target": "src-tauri/src/utils/protobuf.rs",
+      "source_sha256": "86333fbc78c6a2288b70ca910bfc59dc8e9859f837d3d3f462db7a22df7ddb1b",
+      "final_sha256": "4ded856ebadb616ab8203f43f4fe1ee83e14560c91da940f55dc132838feb453",
+      "modified": true
+    },
+    {
+      "source": "src-tauri/src/error.rs",
+      "target": "src-tauri/src/error.rs",
+      "source_sha256": "d3cbddfdf98babd7859a9612a4a9f3b891b2089e74d891300e41076e63471ac9",
+      "final_sha256": "d3cbddfdf98babd7859a9612a4a9f3b891b2089e74d891300e41076e63471ac9",
+      "modified": false
+    },
+    {
+      "source": "src/services/windsurfService.ts",
+      "target": "src/services/windsurfService.ts",
+      "source_sha256": "6cc107d1d31e3028c07bb9d5477991b38fb5beed4507c892cc48679f621eb14a",
+      "final_sha256": "aaee03f95f4ea20103c43699ab7f6fc0768ce03efdff61e1add26cea52aa2b7b",
+      "modified": true
+    },
+    {
+      "source": "src/types/windsurf.ts",
+      "target": "src/types/windsurf.ts",
+      "source_sha256": "9759521624a5c20cd5cbeea642831e522d754379803b52aeff498ad6ab96d1b2",
+      "final_sha256": "43696bbfdb05a5859e5930c0bf6a056dac0776b4be84dfa4548927e3a0ca07a7",
+      "modified": true
+    },
+    {
+      "source": "README.md",
+      "target": "docs/UPSTREAM-README.md",
+      "source_sha256": "7b9dd2e44b3b15125e25e4e0abe25de2503c987e48ecb8c1bba8599a34faf594",
+      "final_sha256": "7b9dd2e44b3b15125e25e4e0abe25de2503c987e48ecb8c1bba8599a34faf594",
+      "modified": false
+    }
+  ],
+  "derivative_version": "0.1.5",
+  "new_auth_module": {
+    "path": "src-tauri/src/modules/official_browser_login.rs",
+    "sha256": "002a255e09ab56d04c55358667fa77f02ca51a5f9384059db0ba564141d9c9b8",
+    "purpose": "Official Desktop callback delegation and automatic local-session import; no third-party OAuth callback registration"
+  },
+  "current_auth_flow": "Upstream loopback listener on /auth; official website local branch; fragment-to-POST; no Desktop callback delegation in primary UI",
+  "official_web_redirect_evidence": "docs/official-redirect-rules.json",
+  "design_reference": "docs/DESIGN-REFERENCE.json"
+}
