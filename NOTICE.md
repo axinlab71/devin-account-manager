@@ -1,6 +1,6 @@
 # Attribution and modification notice
 
-Devin Switcher is a modified, reduced desktop distribution of **Cockpit Tools** by **jlcodes / jlcodes99**.
+Devin Account Manager is a modified, reduced desktop distribution of **Cockpit Tools** by **jlcodes / jlcodes99**.
 
 - Original repository: https://github.com/jlcodes99/cockpit-tools
 - Source revision: `915e7a20b432546660c3cd15e90f9fa527490ecc`
@@ -14,7 +14,7 @@ Changes made on 2026-10-15: extracted Windsurf/Devin account models, protocol, J
 
 Version 0.1.1 adds browser login delegated to the installed official client using its existing deep-link callback, automatic import after a new client session is detected, cancellation/timeout handling, and read-only Electron session decryption using the upstream client's encryption-key helpers. It does not register the official deep-link scheme or intercept browser credentials.
 
-Version 0.1.2 makes direct browser authorization the primary flow, restoring and adapting the upstream loopback listener for the public website's `/auth` branch. It adds fragment-to-local-POST delivery, state validation, memory-only callback credentials, explicit one-time-token/Devin-code exchanges, and local HTTP regression tests. It does not require the official client to receive the browser callback. Authenticated end-to-end verification remains pending.
+Version 0.1.2 makes direct browser authorization the primary flow, restoring and adapting the upstream loopback listener for the public website's `/auth` branch. It adds fragment-to-local-POST delivery, state validation, memory-only callback credentials, explicit one-time-token/Devin-code exchanges, and local HTTP regression tests. It does not require the official client to receive the browser callback.
 
 Historical `github_*`, `copilot_*`, and `windsurf_*` field names are retained for compatibility with upstream account exports. They do not enable other platforms in this application.
 

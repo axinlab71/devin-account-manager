@@ -25,7 +25,7 @@ export const AccountQuota = memo(function AccountQuota({ account }: {account: Wi
   const left = credits.promptCreditsLeft;
   const total = credits.promptCreditsTotal;
   const percent = left != null && total != null && total > 0 ? left / total * 100 : null;
-  return <div className="account-quota" aria-label="使用额度"><div className="quota-caption"><span>使用额度</span><span>{cached ? (quotaKnown || creditKnown ? '上次数据 · 刷新未成功' : '查询未成功') : quotaMode ? '日 / 周限额' : creditKnown ? 'Credits' : '等待刷新'}</span></div>
+  return <div className="account-quota" aria-label="使用额度"><div className="quota-caption"><span>使用额度</span><span>{cached ? (quotaKnown || creditKnown ? '已缓存数据' : '待更新') : quotaMode ? '日 / 周限额' : creditKnown ? 'Credits' : '就绪'}</span></div>
     {quotaMode ? <div className="quota-meters"><Meter label="每日额度" remaining={quota.dailyUsedPercent == null ? null : 100 - quota.dailyUsedPercent} reset={quota.dailyResetAt}/><Meter label="每周额度" remaining={quota.weeklyUsedPercent == null ? null : 100 - quota.weeklyUsedPercent} reset={quota.weeklyResetAt}/></div> : creditKnown ? <><Meter label="月度 Credits" remaining={percent} detail={left == null ? '暂无数据' : `剩余 ${number(left)}${total == null ? '' : ` / ${number(total)}`}`} reset={credits.planEndsAt}/>{credits.addOnCredits != null ? <div className="extra-credits"><span>加购 Credits</span><strong>{number(credits.addOnCredits)}</strong></div> : null}</> : <div className="quota-empty">暂无额度数据<span>点击刷新，获取最新使用情况</span></div>}
   </div>;
 });

@@ -470,11 +470,11 @@ fn oauth_success_html() -> &'static str {
 }
 
 fn fragment_bridge_html() -> &'static str {
-    r#"<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Devin Account Manager 网页授权</title><p id="status">等待授权结果，请勿关闭切号器。</p><script>
+    r#"<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="referrer" content="no-referrer"><title>Devin Account Manager 网页授权</title><p id="status">等待授权结果，请勿关闭 Devin Account Manager。</p><script>
 const p=new URLSearchParams(location.hash.slice(1));
 history.replaceState(null,'','/auth');
 if(p.has('state')&&(p.has('access_token')||p.has('devin_code')||p.has('error'))){
-fetch('/auth',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString(),credentials:'omit',cache:'no-store'}).then(async r=>{document.getElementById('status').textContent=r.ok?'已收到授权结果，请返回 Devin Account Manager 查看账号保存结果。':'回调校验失败，请重新发起授权。';}).catch(()=>{document.getElementById('status').textContent='无法连接切号器，请重新发起授权。';});
+fetch('/auth',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString(),credentials:'omit',cache:'no-store'}).then(async r=>{document.getElementById('status').textContent=r.ok?'已收到授权结果，请返回 Devin Account Manager 查看账号保存结果。':'回调校验失败，请重新发起授权。';}).catch(()=>{document.getElementById('status').textContent='无法连接账户管理器，请重新发起授权。';});
 }</script></html>"#
 }
 
@@ -1577,7 +1577,7 @@ async fn build_devin_payload(
                         }
                     }
                 }
-                // 也试试嵌套 quotaUsage 子对象（用户切号器代码里见过这个结构）
+                // 也试试嵌套 quotaUsage 子对象（账户管理模块常见结构）
                 if fallback_reset.is_none() {
                     if let Some(qu) = obj.get("quotaUsage").and_then(|v| v.as_object()) {
                         for key in &candidates {
