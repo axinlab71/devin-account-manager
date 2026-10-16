@@ -6,11 +6,11 @@
 
 [下载最新版本](https://github.com/sxxxxxxxxxxxxxxxxxxxxx/devin-account-manager/releases/latest) · [上游 Cockpit Tools](https://github.com/jlcodes99/cockpit-tools) · [许可与署名](NOTICE.md)
 
-![账号列表（合成演示数据）](docs/ui-0.3.0-light.png)
+![账号列表（合成演示数据）](docs/ui-0.3.1-light.png)
 
 从 [Cockpit Tools](https://github.com/jlcodes99/cockpit-tools) 提取的精简 Devin Desktop 账号管理应用。核心账号、导入、刷新和客户端会话注入代码来自原项目，并非重新实现一套协议。
 
-## 使用（0.3.0）
+## 使用（0.3.1）
 
 1. 打开 Devin Account Manager，点击“添加账号 → 网页授权 → 开始网页授权”。
 2. 在系统浏览器完成目标账号登录。
@@ -29,6 +29,16 @@
 没有注册或接管 `devin://`，没有修改服务端允许列表，也没有伪造新的 client_id。授权凭据不写入 pending 文件、不出现在日志中；保存的账号详情仍使用原有加密格式。
 
 **验证范围：**本地回调、额度解析、加密保存和模拟客户端注入有自动化回归测试覆盖。离线测试与程序成功启动不能代替真实账号的完整登录、在线刷新和两账号切换验证；具体范围见 [docs/VALIDATION.md](docs/VALIDATION.md)。
+
+## 0.3.1 舒适卡片与独立设置页
+
+- 卡片字号、宽度与操作间距调至适中：1120px 标准窗口为两列，1400px 宽窗口为三列，小窗口为单列；每日/每周重置时间直接显示。
+- 应用设置入口固定在侧栏底部，打开独立页面，按「通用 / 客户端 / 数据管理 / 关于」分类。
+- 通用页可调整主题、账号显示方式、隐私显示与减少动画；偏好自动保存。
+- 客户端路径保存和状态检测、Cockpit / 官方客户端迁移入口、版本与原项目许可分别归入对应分类。
+- 沿用原有登录、导入、刷新、迁移和切换核心实现。
+
+![应用设置（合成测试）](docs/ui-0.3.1-settings.png)
 
 ## 0.3.0 紧凑布局与迁移
 

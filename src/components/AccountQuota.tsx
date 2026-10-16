@@ -12,7 +12,7 @@ function Meter({ label, remaining, detail, reset }: {label: string; remaining: n
   return <div className={`quota-meter ${percent != null && percent <= 15 ? 'low' : ''}`}>
     <div className="quota-heading"><span>{label}</span><strong>{detail || (percent == null ? '暂无数据' : `剩余 ${number(percent)}%`)}</strong></div>
     {percent == null ? <div className="quota-track unknown"/> : <div className="quota-track" role="progressbar" aria-label={`${label}剩余`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent} aria-valuetext={detail || `剩余 ${number(percent)}%`}><span style={{ width: `${percent}%` }}/></div>}
-    {reset ? <details className="quota-reset"><summary>重置时间</summary><small>{resetLabel(reset)}</small></details> : null}
+    {reset ? <small className="quota-reset">{resetLabel(reset)}</small> : null}
   </div>;
 }
 export const AccountQuota = memo(function AccountQuota({ account, refreshFailed = false }: {account: WindsurfAccount; refreshFailed?: boolean}) {
