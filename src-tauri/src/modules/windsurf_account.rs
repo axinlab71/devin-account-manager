@@ -303,6 +303,30 @@ fn persist_quota_query_error(account_id: &str, message: &str) {
     let _ = upsert_account_record(account);
 }
 
+/// Record the outcome of a read-only quota query onto the stored account.
+/// Success refreshes `windsurf_user_status` + `usage_updated_at` and clears
+/// the error; failure only stamps the error fields. Writes go through the
+/// existing encrypted account store — never to the client. `message` must
+/// be generic; no response bodies or credentials are persisted.
+pub(crate) fn record_quota_query(
+    account_id: &str,
+    status_response: Option<&Value>,
+    error_message: Option<&str>,
+) {
+    let Some(mut account) = load_account(account_id) else {
+        return;
+    };
+    if let Some(value) = status_response {
+        account.windsurf_user_status = Some(value.clone());
+        account.usage_updated_at = Some(chrono::Utc::now().timestamp_millis());
+        account.quota_query_last_error = None;
+        account.quota_query_last_error_at = None;
+        let _ = upsert_account_record(account);
+    } else if let Some(message) = error_message {
+        persist_quota_query_error(account_id, message);
+    }
+}
+
 fn normalize_login(payload: &WindsurfOAuthCompletePayload) -> String {
     if !payload.github_login.trim().is_empty() {
         return payload.github_login.trim().to_string();
@@ -897,6 +921,30 @@ pub fn list_accounts_checked() -> Result<Vec<WindsurfAccount>, String> {
             account
         })
         .collect())
+}
+
+/// Strict variant for safety gates: EVERY index entry must deserialize —
+/// a partially-readable store must never be mistaken for "no ambiguity".
+/// Deliberately bypasses `load_account_index_checked`: that path auto-repairs
+/// (rewrites) the index from details files via `filter_map`, which can drop
+/// unreadable entries before we ever see them. This reads the raw index —
+/// no dedup, no repair, no writes.
+pub fn list_accounts_strict() -> Result<Vec<WindsurfAccount>, String> {
+    let path = get_accounts_index_path()?;
+    let content =
+        fs::read_to_string(&path).map_err(|e| format!("账号索引无法读取: {}", e))?;
+    let index: WindsurfAccountIndex = serde_json::from_str(content.trim())
+        .map_err(|e| format!("账号索引无法解析: {}", e))?;
+    index
+        .accounts
+        .iter()
+        .map(|summary| {
+            let mut account = load_account(&summary.id)
+                .ok_or_else(|| format!("账号 {} 无法读取", summary.id))?;
+            merge_local_auth_status_into_account(&mut account);
+            Ok(account)
+        })
+        .collect()
 }
 
 pub fn upsert_account(payload: WindsurfOAuthCompletePayload) -> Result<WindsurfAccount, String> {

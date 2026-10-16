@@ -267,6 +267,176 @@ fn extract_refresh_token_from_unified_entry(data: &[u8]) -> Option<String> {
     extract_string_field(&oauth_info, 3)
 }
 
+/// GetUserStatus/UserStatus proto 中配额相关字段的只读摘要。
+/// 字段映射与前端 parseWindsurfProtoSummary 一致：
+/// 顶层 f3=name, f7=email, f13=planStatus；
+/// planStatus f8=promptAvail, f6=promptUsed, f4=flexAvail, f7=flexUsed,
+/// f14=日剩余%, f15=周剩余%, f17/f18=重置秒, f1=planInfo；
+/// planInfo f2=planName, f12=monthlyPromptCredits, f14=monthlyFlexCredits。
+#[derive(Debug, Clone, Default)]
+pub struct UserStatusQuotaSummary {
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub plan_name: Option<String>,
+    pub daily_remaining_percent: Option<f64>,
+    pub weekly_remaining_percent: Option<f64>,
+    pub daily_reset_at_secs: Option<i64>,
+    pub weekly_reset_at_secs: Option<i64>,
+    /// "available" 字段语义有争议（前端视为月度总额，上游注释视为剩余），
+    /// 调用方按 UnverifiedMapping 处理，不得直接当剩余。
+    pub prompt_credits_available: Option<f64>,
+    pub prompt_credits_used: Option<f64>,
+    pub prompt_credits_monthly: Option<f64>,
+    pub flex_credits_available: Option<f64>,
+    pub flex_credits_used: Option<f64>,
+    pub flex_credits_monthly: Option<f64>,
+}
+
+fn read_len_delim<'a>(data: &'a [u8], offset: usize) -> Option<(&'a [u8], usize)> {
+    let (length, start) = read_varint(data, offset).ok()?;
+    let end = start.checked_add(length as usize)?;
+    if end > data.len() {
+        return None;
+    }
+    Some((&data[start..end], end))
+}
+
+fn read_field_varint(data: &[u8], offset: usize) -> Option<(u64, usize)> {
+    read_varint(data, offset).ok()
+}
+
+/// 与前端 normalizeProtoCreditsValue 相同：>=1000 或 100 的整数倍按 ×100 还原。
+fn normalize_credits(value: u64) -> f64 {
+    let v = value as f64;
+    if v >= 1000.0 || (v >= 100.0 && v % 100.0 == 0.0) {
+        v / 100.0
+    } else {
+        v
+    }
+}
+
+/// 解码 base64 UserStatus proto；任何一步失败返回 None（调用方视为无数据，
+/// 永不把解析失败当成"额度为 0"）。
+pub fn parse_user_status_quota(b64: &str) -> Option<UserStatusQuotaSummary> {
+    let bytes = general_purpose::STANDARD.decode(b64.trim()).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut out = UserStatusQuotaSummary::default();
+    let mut plan_status: Option<Vec<u8>> = None;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let (tag, next) = read_varint(&bytes, offset).ok()?;
+        let field = tag >> 3;
+        let wire = (tag & 7) as u8;
+        if wire == 2 {
+            let (value, end) = read_len_delim(&bytes, next)?;
+            match field {
+                3 => out.name = String::from_utf8(value.to_vec()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                7 => out.email = String::from_utf8(value.to_vec()).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+                13 => plan_status = Some(value.to_vec()),
+                _ => {}
+            }
+            offset = end;
+        } else {
+            offset = skip_field(&bytes, next, wire).ok()?;
+        }
+    }
+
+    let plan_status = plan_status?;
+    let mut plan_info: Option<Vec<u8>> = None;
+    let mut offset = 0;
+    while offset < plan_status.len() {
+        let (tag, next) = read_varint(&plan_status, offset).ok()?;
+        let field = tag >> 3;
+        let wire = (tag & 7) as u8;
+        match (field, wire) {
+            (8, 0) => {
+                let (v, e) = read_field_varint(&plan_status, next)?;
+                out.prompt_credits_available = Some(normalize_credits(v));
+                offset = e;
+            }
+            (6, 0) => {
+                let (v, e) = read_field_varint(&plan_status, next)?;
+                out.prompt_credits_used = Some(normalize_credits(v));
+                offset = e;
+            }
+            (4, 0) => {
+                let (v, e) = read_field_varint(&plan_status, next)?;
+                out.flex_credits_available = Some(normalize_credits(v));
+                offset = e;
+            }
+            (7, 0) => {
+                let (v, e) = read_field_varint(&plan_status, next)?;
+                out.flex_credits_used = Some(normalize_credits(v));
+                offset = e;
+            }
+            (1, 2) => {
+                let (v, e) = read_len_delim(&plan_status, next)?;
+                plan_info = Some(v.to_vec());
+                offset = e;
+            }
+            (14, 0) => {
+                let (v, e) = read_field_varint(&plan_status, next)?;
+                out.daily_remaining_percent = Some((v as f64).clamp(0.0, 100.0));
+                offset = e;
+            }
+            (15, 0) => {
+                let (v, e) = read_field_varint(&plan_status, next)?;
+                out.weekly_remaining_percent = Some((v as f64).clamp(0.0, 100.0));
+                offset = e;
+            }
+            (17, 0) => {
+                let (v, e) = read_field_varint(&plan_status, next)?;
+                out.daily_reset_at_secs = Some(v as i64);
+                offset = e;
+            }
+            (18, 0) => {
+                let (v, e) = read_field_varint(&plan_status, next)?;
+                out.weekly_reset_at_secs = Some(v as i64);
+                offset = e;
+            }
+            _ => {
+                offset = skip_field(&plan_status, next, wire).ok()?;
+            }
+        }
+    }
+
+    if let Some(info) = plan_info {
+        let mut offset = 0;
+        while offset < info.len() {
+            let (tag, next) = read_varint(&info, offset).ok()?;
+            let field = tag >> 3;
+            let wire = (tag & 7) as u8;
+            match (field, wire) {
+                (2, 2) => {
+                    let (v, e) = read_len_delim(&info, next)?;
+                    out.plan_name = String::from_utf8(v.to_vec())
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                    offset = e;
+                }
+                (12, 0) => {
+                    let (v, e) = read_field_varint(&info, next)?;
+                    out.prompt_credits_monthly = Some(normalize_credits(v));
+                    offset = e;
+                }
+                (14, 0) => {
+                    let (v, e) = read_field_varint(&info, next)?;
+                    out.flex_credits_monthly = Some(normalize_credits(v));
+                    offset = e;
+                }
+                _ => {
+                    offset = skip_field(&info, next, wire).ok()?;
+                }
+            }
+        }
+    }
+
+    Some(out)
+}
+
 /// 从 protobuf 消息中提取指定字段的字符串
 fn extract_string_field(data: &[u8], target_field: u32) -> Option<String> {
     let mut offset = 0;

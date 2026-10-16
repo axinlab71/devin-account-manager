@@ -8,7 +8,8 @@ fn normalize(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WindsurfVersionMetadata {
     pub ide_version: Option<String>,
     pub extension_version: Option<String>,

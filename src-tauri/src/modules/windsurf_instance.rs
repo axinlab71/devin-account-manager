@@ -21,7 +21,7 @@ use base64::{engine::general_purpose, Engine as _};
 #[cfg(not(target_os = "windows"))]
 use cbc::cipher::block_padding::Pkcs7;
 #[cfg(not(target_os = "windows"))]
-use cbc::cipher::{BlockEncryptMut, KeyIvInit};
+use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use chrono::Utc;
 #[cfg(not(target_os = "windows"))]
 use pbkdf2::pbkdf2_hmac;
@@ -54,6 +54,12 @@ const WINDSURF_API_SERVER_SECRET_KEY: &str =
     r#"secret://{"extensionId":"codeium.windsurf","key":"windsurf_auth.apiServerUrl"}"#;
 const WINDSURF_SELECTED_AUTH_KEY: &str = "codeium.windsurf-windsurf_auth";
 const WINDSURF_EXTENSION_STATE_KEY: &str = "codeium.windsurf";
+// NOTE: per-account auth-usage keys live under the literal `windsurf_auth-`
+// prefix. Historical code deleted `LIKE 'windsurf_auth-%'` where `_` is a
+// wildcard — it wiped other accounts' usage keys plus look-alike keys
+// (`windsurf.auth-*`, `windsurfXauth-*`, `windsurf-auth-*`). The write path
+// no longer deletes anything under this prefix; keys for other accounts
+// are preserved like the official client does.
 
 const V10_PREFIX: &[u8] = b"v10";
 const V11_PREFIX: &[u8] = b"v11";
@@ -64,6 +70,8 @@ const SALT: &[u8] = b"saltysalt";
 
 #[cfg(not(target_os = "windows"))]
 type Aes128CbcEnc = cbc::Encryptor<Aes128>;
+#[cfg(not(target_os = "windows"))]
+type Aes128CbcDec = cbc::Decryptor<Aes128>;
 
 #[cfg(target_os = "linux")]
 const LINUX_V10_KEY: [u8; 16] = [
@@ -301,6 +309,56 @@ fn encrypt_windows_gcm_v10(key: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Stri
 }
 
 #[cfg(not(target_os = "windows"))]
+fn decrypt_cbc_prefixed(prefix: &[u8], key: &[u8; 16], data: &[u8]) -> Result<Vec<u8>, String> {
+    if !data.starts_with(prefix) {
+        return Err("加密前缀不支持（预期 CBC）".to_string());
+    }
+    let cipher = Aes128CbcDec::new_from_slices(key, &CBC_IV)
+        .map_err(|e| format!("初始化 AES-CBC decryptor 失败: {}", e))?;
+    cipher
+        .decrypt_padded_vec_mut::<Pkcs7>(&data[prefix.len()..])
+        .map_err(|e| format!("AES-CBC 解密失败: {}", e))
+}
+
+/// Decrypt a `secret://` value body (bytes after the `{type:Buffer,...}`
+/// JSON was decoded). Mirrors `encrypt_secret_payload` per platform; any
+/// mismatch is an error — callers must fail closed rather than overwrite.
+fn decrypt_secret_payload(encrypted: &[u8], data_root: &Path) -> Result<Vec<u8>, String> {
+    #[cfg(target_os = "windows")]
+    {
+        if encrypted.len() < 31 || !encrypted.starts_with(V10_PREFIX) {
+            return Err("不支持的会话加密前缀（预期 v10）".to_string());
+        }
+        let key = get_windows_encryption_key(data_root)?;
+        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "会话密钥格式无效")?;
+        return cipher
+            .decrypt(aes_gcm::Nonce::from_slice(&encrypted[3..15]), &encrypted[15..])
+            .map_err(|_| "无法解密官方客户端会话".to_string());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let password = get_macos_safe_storage_password(data_root)?;
+        let key = pbkdf2_sha1_key(&password, 1003);
+        return decrypt_cbc_prefixed(V10_PREFIX, &key, encrypted);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = data_root;
+        if encrypted.starts_with(V11_PREFIX) {
+            let key = get_linux_v11_key()
+                .ok_or("无法读取 Linux Secret Service 密钥（v11）".to_string())?;
+            return decrypt_cbc_prefixed(V11_PREFIX, &key, encrypted);
+        }
+        return decrypt_cbc_prefixed(V10_PREFIX, &LINUX_V10_KEY, encrypted);
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (encrypted, data_root);
+        Err("不支持的系统平台".to_string())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
 fn encrypt_cbc_prefixed(
     prefix: &[u8],
     key: &[u8; 16],
@@ -476,7 +534,7 @@ fn encrypt_secret_payload(
     }
 }
 
-fn encode_encrypted_buffer_json(
+pub(crate) fn encode_encrypted_buffer_json(
     plaintext: &[u8],
     preferred_prefix: Option<&str>,
     data_root: &Path,
@@ -489,7 +547,7 @@ fn encode_encrypted_buffer_json(
     .map_err(|e| format!("序列化 Buffer 失败: {}", e))
 }
 
-fn upsert_windsurf_extension_state(
+pub(crate) fn upsert_windsurf_extension_state(
     conn: &Connection,
     api_server_url: &str,
     access_token: &str,
@@ -503,11 +561,26 @@ fn upsert_windsurf_extension_state(
         .optional()
         .map_err(|e| format!("读取 {} 失败: {}", WINDSURF_EXTENSION_STATE_KEY, e))?;
 
-    let mut state = existing
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .filter(Value::is_object)
-        .unwrap_or_else(|| serde_json::json!({}));
+    let state = match existing.as_deref() {
+        // Key absent: start empty; the official client populates the rest.
+        None => serde_json::json!({}),
+        // Fail closed: a corrupt/non-object extension state means we cannot
+        // prove which unknown fields would be lost — refuse the write rather
+        // than silently dropping official state.
+        Some(raw) => {
+            let parsed: Value = serde_json::from_str(raw).map_err(|_| {
+                format!("{} 内容损坏，已中止写入以保护官方扩展状态", WINDSURF_EXTENSION_STATE_KEY)
+            })?;
+            if !parsed.is_object() {
+                return Err(format!(
+                    "{} 不是 JSON 对象，已中止写入以保护官方扩展状态",
+                    WINDSURF_EXTENSION_STATE_KEY
+                ));
+            }
+            parsed
+        }
+    };
+    let mut state = state;
 
     if let Some(obj) = state.as_object_mut() {
         obj.insert(
@@ -523,19 +596,8 @@ fn upsert_windsurf_extension_state(
         } else {
             obj.remove("windsurf.pendingApiKeyMigration");
         }
-        // 关键: codeium.installationId 必须存在 — 缺这个字段 Windsurf 反作弊会把这次切号
-        // 当作"新机器登录"，触发额外验证 / Permission denied (error 12)。
-        // 优先保留原有值（同一机器多次切号要稳定），不存在才生成新的。
-        if !obj
-            .get("codeium.installationId")
-            .map(|v| v.is_string() && !v.as_str().unwrap_or("").trim().is_empty())
-            .unwrap_or(false)
-        {
-            obj.insert(
-                "codeium.installationId".to_string(),
-                Value::String(Uuid::new_v4().to_string()),
-            );
-        }
+        // codeium.installationId 缺失时保持缺失：绝不替官方生成设备标识。
+        // 官方客户端首次运行会自行生成；我们已有的值原样保留。
     }
 
     let serialized = serde_json::to_string(&state)
@@ -543,7 +605,7 @@ fn upsert_windsurf_extension_state(
     upsert_item(conn, WINDSURF_EXTENSION_STATE_KEY, &serialized)
 }
 
-fn write_windsurf_auth_data(
+pub(crate) fn write_windsurf_auth_data(
     conn: &Connection,
     profile_dir: &Path,
     auth_status: &Value,
@@ -551,13 +613,73 @@ fn write_windsurf_auth_data(
     access_token: &str,
     api_server_url: &str,
 ) -> Result<(), String> {
-    let auth_status_content = serde_json::to_string(auth_status)
+    // windsurfAuthStatus: merge over the client's own value — our identity
+    // fields win, official fields we don't know about are preserved.
+    let merged_auth_status = {
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT value FROM ItemTable WHERE key = ?1",
+                [WINDSURF_AUTH_STATUS_KEY],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("读取 {} 失败: {}", WINDSURF_AUTH_STATUS_KEY, e))?;
+        let mut base = existing
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        if let Some(ours) = auth_status.as_object() {
+            for (k, v) in ours {
+                base.insert(k.clone(), v.clone());
+            }
+        }
+        Value::Object(base)
+    };
+    let auth_status_content = serde_json::to_string(&merged_auth_status)
         .map_err(|e| format!("序列化 windsurfAuthStatus 失败: {}", e))?;
     upsert_item(conn, WINDSURF_AUTH_STATUS_KEY, &auth_status_content)?;
 
+    // windsurf_auth.sessions: merge into the existing encrypted array —
+    // drop prior entries for the same account label, prepend ours, keep
+    // every other session and unknown field. If the existing value is
+    // present but cannot be decrypted or is not an array, fail closed.
     let existing_sessions_prefix =
         query_existing_secret_prefix(conn, WINDSURF_SESSIONS_SECRET_KEY)?;
-    let sessions_payload = serde_json::json!([{
+    let mut merged_sessions: Vec<Value> = Vec::new();
+    let existing_sessions_raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            [WINDSURF_SESSIONS_SECRET_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("读取现有官方会话失败: {}", e))?;
+    if let Some(raw) = existing_sessions_raw
+        .as_deref()
+        .filter(|r| r.trim() != "null")
+    {
+        let buffer: Value = serde_json::from_str(raw)
+            .map_err(|_| "现有官方会话格式无法解析，已中止写入".to_string())?;
+        let encrypted = decode_buffer_data(&buffer)
+            .map_err(|_| "现有官方会话缓冲区无法解析，已中止写入".to_string())?;
+        let plain = decrypt_secret_payload(&encrypted, profile_dir)
+            .map_err(|e| format!("现有官方会话无法解密，已中止写入: {}", e))?;
+        let parsed: Value = serde_json::from_slice(&plain)
+            .map_err(|_| "现有官方会话不是合法 JSON，已中止写入".to_string())?;
+        let arr = parsed
+            .as_array()
+            .ok_or_else(|| "现有官方会话不是数组，已中止写入".to_string())?;
+        for s in arr {
+            let label = s.pointer("/account/label").and_then(Value::as_str);
+            let acc_id = s.pointer("/account/id").and_then(Value::as_str);
+            if label == Some(account_label) || acc_id == Some(account_label) {
+                continue;
+            }
+            merged_sessions.push(s.clone());
+        }
+    }
+    let sessions_payload = serde_json::json!({
         "id": Uuid::new_v4().to_string(),
         "accessToken": access_token,
         "account": {
@@ -565,8 +687,9 @@ fn write_windsurf_auth_data(
             "id": account_label
         },
         "scopes": []
-    }]);
-    let sessions_plain = serde_json::to_string(&sessions_payload)
+    });
+    merged_sessions.insert(0, sessions_payload);
+    let sessions_plain = serde_json::to_string(&Value::Array(merged_sessions))
         .map_err(|e| format!("序列化 windsurf_auth.sessions 失败: {}", e))?;
     let encrypted_sessions = encode_encrypted_buffer_json(
         sessions_plain.as_bytes(),
@@ -600,25 +723,72 @@ fn write_windsurf_auth_data(
             .map_err(|e| format!("序列化 windsurfOnboarding 失败: {}", e))?,
     )?;
 
-    conn.execute("DELETE FROM ItemTable WHERE key LIKE 'windsurf_auth-%'", [])
-        .map_err(|e| format!("清理旧 windsurf_auth-* 键失败: {}", e))?;
-
+    // Per-account usage-tracking keys: the official client never deletes
+    // other accounts' entries, and neither do we. Only the current label's
+    // two keys are touched; every other `windsurf_auth-*` key (other
+    // accounts' usages, future schema keys) is left untouched.
     let login_key = format!("windsurf_auth-{}", account_label);
     let usage_key = format!("windsurf_auth-{}-usages", account_label);
+
+    let read_key = |key: &str| -> Result<Option<String>, String> {
+        conn.query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            [key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("读取 {} 失败: {}", key, e))
+    };
+
+    // windsurf_auth-<label>: preserve whatever the client recorded for this
+    // account; write the known empty shape only when absent.
+    if read_key(&login_key)?.is_none() {
+        upsert_item(conn, &login_key, "[]")?;
+    }
+
+    // windsurf_auth-<label>-usages: merge — update/append our extension's
+    // entry, keep other extensions' entries and unknown fields. A present
+    // but non-array value is left alone (fail closed, we can't prove what
+    // merging into it would destroy).
     // 本地 Devin 3.x 写入的 extensionName 为 "Devin"；旧 Windsurf 为 "Windsurf"。
     // 统一写 Devin 以匹配当前客户端字段，旧客户端忽略该展示字段。
-    let usage_value = serde_json::json!([{
+    let our_usage = serde_json::json!({
         "extensionId": "codeium.windsurf",
         "extensionName": "Devin",
         "scopes": [],
         "lastUsed": Utc::now().timestamp_millis()
-    }]);
-    upsert_item(conn, &login_key, "[]")?;
-    upsert_item(
-        conn,
-        &usage_key,
-        &serde_json::to_string(&usage_value).map_err(|e| format!("序列化 usages 失败: {}", e))?,
-    )?;
+    });
+    let merged_usages = match read_key(&usage_key)? {
+        None => Some(vec![our_usage.clone()]),
+        Some(raw) => match serde_json::from_str::<Value>(&raw) {
+            Ok(Value::Array(mut arr)) => {
+                match arr
+                    .iter()
+                    .position(|e| e.get("extensionId").and_then(Value::as_str) == Some("codeium.windsurf"))
+                {
+                    Some(i) => {
+                        // Preserve unknown fields on our own entry too.
+                        if let (Some(dst), Some(src)) =
+                            (arr[i].as_object_mut(), our_usage.as_object())
+                        {
+                            for (k, v) in src {
+                                dst.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    None => arr.push(our_usage.clone()),
+                }
+                Some(arr)
+            }
+            // Unknown shape: do not overwrite, leave the key as-is.
+            _ => None,
+        },
+    };
+    if let Some(usages) = merged_usages {
+        let serialized = serde_json::to_string(&usages)
+            .map_err(|e| format!("序列化 usages 失败: {}", e))?;
+        upsert_item(conn, &usage_key, &serialized)?;
+    }
 
     Ok(())
 }
@@ -662,7 +832,16 @@ fn state_db_score(db_path: &Path) -> i32 {
     if !db_path.is_file() {
         return 0;
     }
-    let Ok(conn) = Connection::open(db_path) else {
+    // Scoring is read-only work — prefer a read-only handle so we do not
+    // create -shm/-wal artifacts or touch the official database's mtime.
+    // Some locked/WAL states reject read-only opens; fall back to the
+    // previous read-write open so candidate selection stays identical.
+    let conn = Connection::open_with_flags(
+        db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .or_else(|_| Connection::open(db_path));
+    let Ok(conn) = conn else {
         // 文件存在但无法打开时，仍高于“无文件”
         return 10;
     };
@@ -2052,10 +2231,7 @@ pub fn read_profile_session_auth_status(profile_dir: &Path) -> Result<Option<Val
         if bytes.len() < 31 || !bytes.starts_with(V10_PREFIX) {
             return Err("不支持当前官方客户端的会话加密格式，请使用手动导入".into());
         }
-        let key = get_windows_encryption_key(profile_dir)?;
-        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| "客户端会话密钥格式无效")?;
-        cipher
-            .decrypt(aes_gcm::Nonce::from_slice(&bytes[3..15]), &bytes[15..])
+        decrypt_secret_payload(&bytes, profile_dir)
             .map_err(|_| "无法解密官方客户端会话，请使用当前 Windows 用户登录".to_string())
     };
     let sessions: Value =
@@ -2099,6 +2275,15 @@ pub fn read_profile_session_auth_status(profile_dir: &Path) -> Result<Option<Val
         serde_json::json!({"apiKey":token,"apiServerUrl":server,"name":label,"status":"SignedIn"});
     if let Some(id) = session.get("id").and_then(Value::as_str) {
         auth["_switcherDesktopSessionId"] = Value::String(id.into());
+    }
+    // The session's Devin user id — a much stronger identity signal for
+    // post-switch verification than the display label alone.
+    if let Some(id) = session
+        .pointer("/account/id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        auth["_switcherDesktopAccountId"] = Value::String(id.into());
     }
     if token.starts_with("devin-session-token$") {
         auth["sessionToken"] = Value::String(token.into());

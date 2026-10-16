@@ -102,7 +102,7 @@ fn proto_get_first_string(data: &[u8], target_field: u32) -> Option<String> {
 
 // ========== HTTP client ==========
 
-fn build_client() -> Result<Client, String> {
+pub(crate) fn build_client() -> Result<Client, String> {
     Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(UA)
@@ -288,7 +288,7 @@ async fn windsurf_post_auth(
 
 // ========== 3. GetOneTimeAuthToken: session → ott ==========
 
-async fn get_one_time_auth_token(
+pub(crate) async fn get_one_time_auth_token(
     client: &Client,
     session_token: &str,
     auth1: &str,
@@ -569,12 +569,55 @@ pub async fn full_refresh_from_auth1(auth1_token: &str) -> Result<DevinFullRefre
 /// planInfo.monthlyPromptCredits                 // 月度总额度
 /// planInfo.monthlyFlowCredits                   // 月度 flow 总额度
 /// ```
-pub async fn fetch_devin_user_status(ide_token: &str) -> Result<serde_json::Value, String> {
+/// Structured failure for the read-only status query. Lets the quota monitor
+/// classify 401/403/429/5xx/transport/parse failures distinctly — a 429 is
+/// rate limiting, never quota exhaustion.
+#[derive(Debug)]
+pub enum UserStatusError {
+    Http { status: u16, retry_after_ms: Option<i64> },
+    Transport(String),
+    Parse(String),
+}
+
+impl std::fmt::Display for UserStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UserStatusError::Http { status, .. } => write!(f, "GetUserStatus HTTP {}", status),
+            UserStatusError::Transport(e) => write!(f, "GetUserStatus 请求失败: {}", e),
+            UserStatusError::Parse(e) => write!(f, "解析 GetUserStatus 响应失败: {}", e),
+        }
+    }
+}
+
+impl std::error::Error for UserStatusError {}
+
+impl From<UserStatusError> for crate::modules::quota_monitor::QueryFailure {
+    fn from(e: UserStatusError) -> Self {
+        use crate::modules::quota_monitor::QueryFailure as Q;
+        match e {
+            UserStatusError::Http { status, retry_after_ms } => match status {
+                401 => Q::AuthRejected,
+                403 => Q::PolicyDenied,
+                429 => Q::RateLimited { retry_after_ms },
+                s if s >= 500 => Q::ServerError { status: s },
+                s => Q::ServerError { status: s },
+            },
+            UserStatusError::Transport(_) => Q::Network,
+            UserStatusError::Parse(_) => Q::ParseFailed,
+        }
+    }
+}
+
+/// Same read-only GetUserStatus query as `fetch_devin_user_status`, but with
+/// a structured error. Never retries, never mutates credentials.
+pub async fn fetch_devin_user_status_detailed(
+    ide_token: &str,
+) -> Result<serde_json::Value, UserStatusError> {
     let token = ide_token.trim();
     if token.is_empty() {
-        return Err("ide_token 不能为空".to_string());
+        return Err(UserStatusError::Transport("ide_token 不能为空".to_string()));
     }
-    let client = build_client()?;
+    let client = build_client().map_err(UserStatusError::Transport)?;
     let versions = tokio::task::spawn_blocking(|| {
         crate::modules::client_version::detect_windsurf_version_metadata("Devin", None)
     })
@@ -598,24 +641,36 @@ pub async fn fetch_devin_user_status(ide_token: &str) -> Result<serde_json::Valu
         Some(UA),
     )
     .await
-    .map_err(|e| format!("GetUserStatus 请求失败: {}", e))?;
+    .map_err(|e| UserStatusError::Transport(format!("{}", e)))?;
 
     let status = resp.status();
+    let retry_after_ms = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|secs| (secs * 1000) as i64);
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        return Err(format!(
-            "GetUserStatus HTTP {}: {}",
-            status.as_u16(),
-            format!("body_len={}", text.len())
-        ));
+        return Err(UserStatusError::Http {
+            status: status.as_u16(),
+            retry_after_ms,
+        });
     }
     serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {
-        format!(
-            "解析 GetUserStatus 响应失败: {} (body_len={})",
-            e,
-            text.len()
-        )
+        UserStatusError::Parse(format!("{} (body_len={})", e, text.len()))
     })
+}
+
+pub async fn fetch_devin_user_status(ide_token: &str) -> Result<serde_json::Value, String> {
+    fetch_devin_user_status_detailed(ide_token)
+        .await
+        .map_err(|e| match e {
+            UserStatusError::Http { status, .. } => {
+                format!("GetUserStatus HTTP {}: body_len=n/a", status)
+            }
+            other => other.to_string(),
+        })
 }
 
 // ========== 工具 ==========

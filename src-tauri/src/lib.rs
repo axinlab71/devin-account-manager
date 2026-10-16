@@ -2,6 +2,10 @@ pub mod error;
 pub mod models;
 pub mod modules;
 #[cfg(test)]
+mod auth_compat_tests;
+#[cfg(test)]
+mod rotation_tests;
+#[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
 mod security_tests;
@@ -315,6 +319,164 @@ async fn restore_last_client_state() -> Result<String, String> {
     Ok("已恢复上一次切换前的数据库，请在客户端确认账号。".into())
 }
 
+/// Read-only audit of the official profile's auth-related ItemTable keys.
+/// Never writes, decrypts, or returns credential material.
+#[tauri::command]
+fn probe_auth_compatibility(
+) -> Result<modules::auth_compatibility::AuthCompatibilityReport, String> {
+    let configured = modules::config::get_user_config().windsurf_app_path;
+    let configured = configured.trim();
+    let configured = if configured.is_empty() {
+        None
+    } else {
+        Some(configured)
+    };
+    modules::auth_compatibility::probe_default_profile(configured)
+}
+
+// ---------- Rotation monitor (phase 2: read-only decisions, no client writes) ----------
+
+#[tauri::command]
+fn get_rotation_status() -> Result<modules::rotation_policy::RotationStatusDto, String> {
+    Ok(modules::quota_monitor::global().status())
+}
+
+#[tauri::command]
+fn set_rotation_config(
+    config: modules::rotation_state::RotationConfig,
+) -> Result<modules::rotation_policy::RotationStatusDto, String> {
+    modules::quota_monitor::global().set_config(config)
+}
+
+#[tauri::command]
+fn pause_rotation(reason: Option<String>) -> Result<modules::rotation_policy::RotationStatusDto, String> {
+    modules::quota_monitor::global().pause(reason.as_deref().unwrap_or("user"))
+}
+
+#[tauri::command]
+fn resume_rotation() -> Result<modules::rotation_policy::RotationStatusDto, String> {
+    modules::quota_monitor::global().resume()
+}
+
+/// One serial quota scan across the enabled pool + current account. Read-only:
+/// uses the same endpoint as manual refresh, never writes to the client.
+#[tauri::command]
+async fn scan_rotation_now(
+) -> Result<modules::rotation_policy::RotationStatusDto, String> {
+    let current = current_account_id();
+    let monitor = modules::quota_monitor::global();
+    monitor
+        .run_scan_once(&modules::quota_monitor::DevinUserStatusFetcher, current)
+        .await?;
+    Ok(monitor.status())
+}
+
+/// What switch execution paths are actually usable. Evidence-based: anything
+/// without verified acceptance reports `unsupported`/`blocked`, never hopes.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SwitchCapabilitiesDto {
+    /// Standard restart switch via the existing manual command.
+    restart_switch: &'static str,
+    /// L2 same-process switch: no verified external interface exists.
+    native_hot_switch: &'static str,
+    isolated_profile_switch: &'static str,
+    /// Full-auto rotation requires verified L2 + auth compat + workload
+    /// safety detection — none are established yet.
+    auto_rotation: &'static str,
+    notes: Vec<String>,
+}
+
+#[tauri::command]
+fn get_switch_capabilities() -> SwitchCapabilitiesDto {
+    SwitchCapabilitiesDto {
+        restart_switch: "manual_confirmed_only",
+        native_hot_switch: "implemented_unverified",
+        isolated_profile_switch: "unsupported",
+        auto_rotation: "blocked_no_l2_evidence",
+        notes: vec![
+            "阶段一写入修正已实施（见 docs/AUTH_COMPATIBILITY.md §5），自动执行仍待真实验收".into(),
+            "L2 研究见 docs/HOT_SWITCH_RESEARCH.md：devin:// URI 登录是未实测的候选路径".into(),
+        ],
+    }
+}
+
+/// Confirm a pending recommendation. Phase A re-validates everything
+/// server-side (gate); phase B dispatches to the native URI-login adapter,
+/// which only *launches* the official `devin://` login — the client's own
+/// confirmation modal is the second gate and no client files are touched.
+/// A blocked/failed adapter outcome performs zero writes.
+#[tauri::command]
+async fn confirm_rotation(
+    suggestion_id: String,
+    target_account_id: String,
+    expected_current_account_id: Option<String>,
+) -> Result<modules::switch_adapter::SwitchOutcome, String> {
+    // Same serialization domain as manual switching/recovery: a rotation
+    // launch must not overlap any other client operation.
+    let _guard = CLIENT_LOCK
+        .try_lock()
+        .map_err(|_| "正在操作客户端，请稍后再试")?;
+    let _file_guard = modules::process::lock_client_operation()?;
+    let current = current_account_id();
+    let request = modules::switch_adapter::SwitchRequest {
+        suggestion_id,
+        target_account_id,
+        expected_current_id: expected_current_account_id
+            .or_else(|| current.clone())
+            .unwrap_or_default(),
+        confirmed: true,
+    };
+    let monitor = modules::quota_monitor::global();
+    monitor.begin_confirm(current, &request)?;
+    let outcome = modules::native_switch::execute(&request.target_account_id).await;
+    monitor.finish_confirm(&request, &outcome);
+    Ok(outcome)
+}
+
+/// Read-only post-launch check: did the official client's stored session
+/// switch to the target account? On `verified` the monitor records the
+/// completed switch (cooldown + last-switch timestamp).
+#[tauri::command]
+fn verify_native_login(
+    target_account_id: String,
+) -> Result<modules::native_switch::NativeVerifyResult, String> {
+    let result = modules::native_switch::verify(&target_account_id)?;
+    if matches!(result, modules::native_switch::NativeVerifyResult::Verified { .. }) {
+        modules::quota_monitor::global().mark_verified(&target_account_id);
+    }
+    Ok(result)
+}
+
+/// Manual experimental same-process switch: launches the official `devin://`
+/// login URI for a chosen account WITHOUT needing a low-quota recommendation.
+/// Experimental — the official client shows its own confirmation modal; we
+/// write nothing to client files. Verify afterwards via `verify_native_login`.
+#[tauri::command]
+async fn try_native_switch(
+    account_id: String,
+) -> Result<modules::switch_adapter::SwitchOutcome, String> {
+    let _guard = CLIENT_LOCK
+        .try_lock()
+        .map_err(|_| "正在操作客户端，请稍后再试")?;
+    let _file_guard = modules::process::lock_client_operation()?;
+    Ok(modules::native_switch::execute(&account_id).await)
+}
+
+/// Dismiss the pending recommendation without executing anything.
+#[tauri::command]
+fn dismiss_rotation(suggestion_id: String) -> Result<(), String> {
+    modules::quota_monitor::global().dismiss(&suggestion_id)
+}
+
+/// User acknowledgement that the recovered-from-backup state is reconciled:
+/// only meaningful when no in-flight record exists to verify/dismiss.
+#[tauri::command]
+fn acknowledge_rotation_recovery(
+) -> Result<modules::rotation_policy::RotationStatusDto, String> {
+    modules::quota_monitor::global().acknowledge_recovery()
+}
+
 #[tauri::command]
 fn cleanup_legacy_client_backups() -> Result<usize, String> {
     let _guard = CLIENT_LOCK
@@ -326,6 +488,16 @@ fn cleanup_legacy_client_backups() -> Result<usize, String> {
 
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            let monitor = modules::quota_monitor::global();
+            monitor.attach_app(app.handle().clone());
+            // Background poll scans resolve the current account through the
+            // same local-matching path the command layer uses.
+            monitor.set_current_id_resolver(current_account_id);
+            // Honour persisted config: mode defaults to Off on first install.
+            monitor.start_if_configured();
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_windsurf_accounts,
             delete_windsurf_account,
@@ -341,6 +513,18 @@ pub fn run() {
             official_browser_login_poll,
             official_browser_login_cancel,
             get_client_status,
+            probe_auth_compatibility,
+            get_rotation_status,
+            set_rotation_config,
+            pause_rotation,
+            resume_rotation,
+            scan_rotation_now,
+            confirm_rotation,
+            try_native_switch,
+            verify_native_login,
+            dismiss_rotation,
+            acknowledge_rotation_recovery,
+            get_switch_capabilities,
             get_recovery_status,
             cleanup_legacy_client_backups,
             get_oauth_login_phase,

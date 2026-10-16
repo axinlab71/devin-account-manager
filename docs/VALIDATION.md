@@ -1,5 +1,20 @@
 # 验证记录
 
+## feat/safe-account-rotation（未发布）· 本分支
+
+- 109 项 Rust 离线测试通过：阶段一六项写入修正（批量删除移除、sessions
+  解密合并、`codeium.windsurf` 损坏 fail-closed、installationId 不生成、
+  authStatus 合并、usages 合并）全部由合成 profile + DPAPI 测试锚定；
+  轮换决策（双确认、时钟异常、429/Retry-After、跨组织、熔断）、proto
+  配额解码、URI 编码均有测试。
+- TypeScript/Vite 构建、额度解析脚本、合成 UI 回归（含轮换横幅确认/忽略/
+  待验证状态）全部通过；`diff --check` 干净。
+- `NativeAuthSwitchAdapter` 已实现（官方 `devin://` URI 登录 + ott 铸造 +
+  只读会话验证），但**未在真实客户端运行过**；`get_switch_capabilities`
+  如实报告 `implemented_unverified`。
+- 没有使用真实账号进行切换、授权或热切换验收；真实验收清单见
+  `docs/ROTATION_VALIDATION.md`，全部通过前不得宣称 L2 可用。
+
 ## v0.4.0 Beta · 2026-10-16
 
 - 55 项 Rust 离线测试通过。新增摘要字段隔离、嵌套秘密过滤、纯额度 protobuf、官方端点精确校验、恶意 JSON 整批预检、旧账号刷新阻断、同邮箱多组织、组织变化拒绝、当前组织歧义处理、跨进程操作锁、旧格式组织身份回读、长期凭据轮换与切换时间语义。

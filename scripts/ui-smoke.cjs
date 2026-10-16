@@ -12,6 +12,7 @@ const path = require('node:path');
   const now = Math.floor(Date.now()/1000);
   const account = (id,name,email,plan,days) => ({id,github_name:name,github_login:email,github_email:email,github_id:0,credential_state:'unverified',last_switched_at:now-days*3600,copilot_plan:plan,created_at:now-days*86400,last_used:now-days*3600});
   window.uiFixture = { accounts:[{...account('demo-1','Alex Chen','alex@example.com','Pro',1),windsurf_plan_status:{planInfo:{monthlyPromptCredits:5000},availablePromptCredits:5000,usedPromptCredits:1200}}, {...account('demo-2','Design Studio','design@example.com','Teams',3),windsurf_plan_status:{billingStrategy:'quota',dailyQuotaRemainingPercent:75,weeklyQuotaRemainingPercent:40,dailyQuotaResetAtUnix:now+3600,weeklyQuotaResetAtUnix:now+86400}}, {...account('demo-3','Personal','personal@example.com','Free',5),quota_query_last_error:'synthetic expired'}],calls:[],legacyCount:2 };
+  const mockRotationCfg = () => ({mode:'off',enabledPool:[],thresholdPercent:10,pollIntervalSecs:60,snapshotMaxAgeSecs:120,lowConfirmGapMs:5000,candidateMarginPoints:5,minSwitchIntervalSecs:600,cooldownSecs:1800,maxConsecutiveFailures:3,sortMode:'min_remaining_desc',priorities:{}});
   window.__TAURI_INTERNALS__ = { invoke: async (cmd,args) => {
    const f=window.uiFixture; f.calls.push(cmd);
    if(cmd==='list_windsurf_accounts') {if(sessionStorage.getItem('failList')) throw new Error('synthetic storage error');return [...f.accounts];}
@@ -29,6 +30,13 @@ const path = require('node:path');
    if(cmd==='import_cockpit_accounts')return {imported:1,skipped:1,failed:0};
    if(cmd==='add_windsurf_account_with_token' || cmd==='import_windsurf_from_json')return [];
    if(cmd==='delete_windsurf_account'){f.accounts=f.accounts.filter(a=>a.id!==args.accountId);return;}
+   if(cmd==='plugin:event|listen'||cmd==='plugin:event|unlisten')return 0;
+   if(cmd==='get_rotation_status')return f.rotation?JSON.parse(JSON.stringify(f.rotation)):{config:mockRotationCfg(),mode:'off',paused:false,thresholdPercent:10,pollIntervalSecs:60,enabledPool:[],scanning:false,monitoringActive:false,consecutiveFailures:0,snapshots:[]};
+   if(cmd==='set_rotation_config'||cmd==='pause_rotation'||cmd==='resume_rotation')return {config:args?.config||mockRotationCfg(),mode:args?.config?.mode||'off',paused:cmd==='pause_rotation',thresholdPercent:10,pollIntervalSecs:60,enabledPool:[],scanning:false,monitoringActive:false,consecutiveFailures:0,snapshots:[]};
+   if(cmd==='scan_rotation_now'){f.rotation={config:{...mockRotationCfg(),mode:'smart_confirm',enabledPool:['demo-2','demo-3']},mode:'smart_confirm',paused:false,thresholdPercent:10,pollIntervalSecs:60,enabledPool:['demo-2','demo-3'],scanning:false,monitoringActive:true,consecutiveFailures:0,lastDecision:{kind:'recommendation',reasons:['low_quota_confirmed'],target:{accountId:'demo-3',orgId:'org-b',minApplicablePercent:88,crossOrg:true},suggestionId:'sug-ui',expiresAtMs:Date.now()+60000,requiresConfirmation:true},snapshots:[{accountId:'demo-3',orgId:'org-b',minApplicablePercent:88,queriedAtMs:Date.now(),confidence:'verified',healthy:true}]};return f.rotation;}
+   if(cmd==='confirm_rotation'){if(f.rotation?.lastDecision)f.rotation.lastDecision.resolution='awaiting_client';return {targetAccountId:args.targetAccountId,adapter:'native',restartRequired:false,localMatch:'not_attempted',clientRecognized:'not_attempted',remoteVerified:'not_attempted',rollback:'not_needed',message:'已向 Devin 发起官方登录请求，请在客户端弹出的确认框中确认；完成后点击「验证生效」。'};}
+   if(cmd==='verify_native_login')return {state:'pending'};
+   if(cmd==='dismiss_rotation'){if(f.rotation)f.rotation.lastDecision=undefined;return;}
    throw new Error('Unexpected mock command: '+cmd);
   }};
  });
@@ -70,6 +78,18 @@ const path = require('node:path');
  await page.getByRole('button',{name:'清理旧版备份',exact:true}).click();await page.getByRole('button',{name:'确认清理',exact:true}).click();await page.getByRole('dialog').waitFor({state:'hidden'});assert.equal(await page.getByRole('button',{name:'清理旧版备份',exact:true}).isDisabled(),true);await page.getByRole('button',{name:'关闭提示',exact:true}).click();
  await page.getByRole('button',{name:'导入账号',exact:true}).click();await page.getByRole('tab',{name:'本地迁移',exact:true}).waitFor();await page.keyboard.press('Escape');
  await page.getByRole('tab',{name:'关于',exact:true}).click();await page.getByText('v0.4.0',{exact:true}).waitFor();assert.equal(await page.getByRole('link',{name:/开源仓库/}).getAttribute('href'),'https://github.com/axinlab71/devin-account-manager');await page.screenshot({path:'docs/ui-0.4.0-about.png',fullPage:true});
+ // Rotation tab: monitoring controls, scan → recommendation banner, gated confirm, dismiss.
+ await page.getByRole('tab',{name:'额度轮换',exact:true}).click();await page.getByText('额度监控',{exact:true}).waitFor();
+ assert.equal(await page.getByRole('combobox',{name:'监控模式'}).locator('option[value="auto"]').isDisabled(),true);
+ await page.getByRole('button',{name:'保存设置',exact:true}).click();await page.getByText('已保存。',{exact:true}).waitFor();
+ await page.getByRole('button',{name:'立即扫描',exact:true}).click();
+ await page.locator('.sidebar .nav-item').first().click();
+ const banner=page.locator('.client-warning').filter({hasText:'建议切换到'});
+ await banner.waitFor();assert.match(await banner.innerText(),/不同组织/);
+ await banner.getByRole('button',{name:'切换到此账号',exact:true}).click();await banner.getByText(/官方登录请求/).waitFor();
+ await banner.getByRole('button',{name:'验证生效',exact:true}).click();await banner.getByText(/请在 Devin 确认框中点击确认后再验证/).waitFor();
+ await banner.getByRole('button',{name:'关闭',exact:true}).click();await banner.waitFor({state:'hidden'});
+ await page.getByRole('button',{name:'应用设置',exact:true}).click();await page.getByRole('tab',{name:'关于',exact:true}).click();
  await page.getByRole('tab',{name:'关于',exact:true}).press('Home');assert.equal(await page.getByRole('tab',{name:'通用',exact:true}).getAttribute('aria-selected'),'true');
  await page.locator('.sidebar .nav-item').first().click();
  await page.locator('h1').click();
@@ -141,6 +161,6 @@ const path = require('node:path');
 
  await page.evaluate(()=>sessionStorage.setItem('pendingSwitch','true'));await page.reload();await page.getByRole('button',{name:'查看恢复操作',exact:true}).waitFor();await page.getByRole('button',{name:'查看恢复操作',exact:true}).click();await page.getByRole('dialog').getByRole('button',{name:'取消',exact:true}).click();
  assert.deepEqual(errors,[]);
- console.log('PASS: safe-view fixtures without credentials; recovery confirmation/cancel/failure/success; legacy cleanup; pending-switch notice; OAuth progress;  three-column card dimensions + six-account/two-row layout + 1000px two-column + 720px single-column; settings is a page with bottom navigation; four settings tabs + keyboard navigation; path save; reduced motion and privacy switches; settings migration entry; 3 synthetic accounts; current-first; search; filters; privacy; grid/list; theme + preference persistence; auth waiting/cancel; Token/JSON tabs; Escape; partial refresh; delete cancel/confirm; 720px responsive; quota percentages + credits + missing data; no overview banners; client status in settings; success toast auto-dismiss; stale quota labeling; bulk stop-after-current; client read failure preserves accounts; storage read failure + retry; zero browser exceptions.');
+ console.log('PASS: safe-view fixtures without credentials; recovery confirmation/cancel/failure/success; legacy cleanup; pending-switch notice; OAuth progress; rotation tab + scan → recommendation banner + gated confirm + dismiss;  three-column card dimensions + six-account/two-row layout + 1000px two-column + 720px single-column; settings is a page with bottom navigation; four settings tabs + keyboard navigation; path save; reduced motion and privacy switches; settings migration entry; 3 synthetic accounts; current-first; search; filters; privacy; grid/list; theme + preference persistence; auth waiting/cancel; Token/JSON tabs; Escape; partial refresh; delete cancel/confirm; 720px responsive; quota percentages + credits + missing data; no overview banners; client status in settings; success toast auto-dismiss; stale quota labeling; bulk stop-after-current; client read failure preserves accounts; storage read failure + retry; zero browser exceptions.');
  await browser.close();
 })().catch(e=>{console.error(e);process.exit(1)});
