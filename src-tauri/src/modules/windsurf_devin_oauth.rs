@@ -177,7 +177,7 @@ pub async fn login_with_password(
             format!(
                 "Devin 登录失败 (HTTP {}): {}",
                 status.as_u16(),
-                truncate(&text, 200)
+                format!("body_len={}", text.len())
             )
         };
         return Err(friendly);
@@ -187,14 +187,19 @@ pub async fn login_with_password(
         format!(
             "解析 Devin 登录响应失败: {} (body: {})",
             e,
-            truncate(&text, 200)
+            format!("body_len={}", text.len())
         )
     })?;
 
     let auth1 = parsed
         .token
         .filter(|t| t.starts_with("auth1_"))
-        .ok_or_else(|| format!("Devin 登录响应未含 auth1_token: {}", truncate(&text, 200)))?;
+        .ok_or_else(|| {
+            format!(
+                "Devin 登录响应未含 auth1_token: {}",
+                format!("body_len={}", text.len())
+            )
+        })?;
 
     Ok(DevinPasswordLoginResult {
         auth1_token: auth1,
@@ -236,7 +241,11 @@ async fn windsurf_post_auth(
                 let status = r.status();
                 if !status.is_success() {
                     let body_text = r.text().await.unwrap_or_default();
-                    last_err = format!("HTTP {}: {}", status.as_u16(), truncate(&body_text, 200));
+                    last_err = format!(
+                        "HTTP {}: {}",
+                        status.as_u16(),
+                        format!("body_len={}", body_text.len())
+                    );
                     if attempt < 3 {
                         // 4xx 大概率 auth1 未就绪 (服务端索引需要 1-2 秒)，等更久
                         let wait_ms = if status.as_u16() >= 400 && status.as_u16() < 500 {
@@ -312,7 +321,11 @@ async fn get_one_time_auth_token(
                 let status = r.status();
                 if !status.is_success() {
                     let body_text = r.text().await.unwrap_or_default();
-                    last_err = format!("HTTP {}: {}", status.as_u16(), truncate(&body_text, 200));
+                    last_err = format!(
+                        "HTTP {}: {}",
+                        status.as_u16(),
+                        format!("body_len={}", body_text.len())
+                    );
                     if attempt < 3 {
                         tokio::time::sleep(Duration::from_millis((2000 * attempt) as u64)).await;
                         continue;
@@ -367,7 +380,11 @@ async fn register_user(client: &Client, ott: &str) -> Result<String, String> {
                 let status = r.status();
                 if !status.is_success() {
                     let body_text = r.text().await.unwrap_or_default();
-                    last_err = format!("HTTP {}: {}", status.as_u16(), truncate(&body_text, 200));
+                    last_err = format!(
+                        "HTTP {}: {}",
+                        status.as_u16(),
+                        format!("body_len={}", body_text.len())
+                    );
                     if attempt < 3 {
                         tokio::time::sleep(Duration::from_millis((2000 * attempt) as u64)).await;
                         continue;
@@ -447,7 +464,7 @@ async fn get_current_user_proto(
         return Err(format!(
             "GetCurrentUser HTTP {}: {}",
             status.as_u16(),
-            truncate(&text, 200)
+            format!("body_len={}", text.len())
         ));
     }
     let raw = resp
@@ -589,7 +606,7 @@ pub async fn fetch_devin_user_status(ide_token: &str) -> Result<serde_json::Valu
         return Err(format!(
             "GetUserStatus HTTP {}: {}",
             status.as_u16(),
-            truncate(&text, 200)
+            format!("body_len={}", text.len())
         ));
     }
     serde_json::from_str::<serde_json::Value>(&text).map_err(|e| {

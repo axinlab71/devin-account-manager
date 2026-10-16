@@ -8,7 +8,7 @@ import {
   normalizeTimestamp as parseTimestampSeconds,
 } from '../utils/dataExtract';
 
-/** Windsurf 账号数据（后端原样返回的结构） */
+/** 后端安全摘要：不包含登录凭据或完整认证响应。 */
 export interface WindsurfAccount {
   id: string;
   github_login: string;
@@ -16,12 +16,6 @@ export interface WindsurfAccount {
   github_name?: string | null;
   github_email?: string | null;
   tags?: string[] | null;
-
-  // 注意：这里包含敏感信息。前端不应打印/上报。
-  github_access_token: string;
-  github_token_type?: string | null;
-  github_scope?: string | null;
-  copilot_token: string;
 
   copilot_plan?: string | null;
   copilot_chat_enabled?: boolean | null;
@@ -31,15 +25,16 @@ export interface WindsurfAccount {
   copilot_quota_reset_date?: string | null;
   copilot_limited_user_quotas?: unknown;
   copilot_limited_user_reset_date?: number | null;
-  windsurf_api_key?: string | null;
-  windsurf_api_server_url?: string | null;
-  windsurf_auth_token?: string | null;
   windsurf_user_status?: unknown;
   windsurf_plan_status?: unknown;
-  windsurf_auth_status_raw?: unknown;
   quota_query_last_error?: string | null;
   quota_query_last_error_at?: number | null;
 
+  usage_proto_b64?: string | null;
+  display_token_claims?: Record<string,string>;
+  credential_state?: 'unverified' | 'expired';
+  last_switched_at?: number | null;
+  credentials_updated_at?: number | null;
   usage_updated_at?: number | null;
   created_at: number;
   last_used: number;
@@ -264,7 +259,7 @@ function resolveWindsurfRemotePlanName(account: WindsurfAccount): string | null 
 }
 
 export function getWindsurfPlanBadge(account: WindsurfAccount): WindsurfPlanBadge {
-  const tokenMap = parseTokenMap(account.copilot_token || '');
+  const tokenMap = account.display_token_claims || {};
   const skuBadge = resolvePlanFromSku(tokenMap['sku'] || '');
   if (skuBadge) return skuBadge;
 
@@ -333,7 +328,6 @@ export function getWindsurfAccountDisplayEmail(account: WindsurfAccount): string
 
   const remoteEmail =
     getStringFromPaths(account.windsurf_user_status, [['userStatus', 'email'], ['email']]) ??
-    getStringFromPaths(account.windsurf_auth_status_raw, [['email']]) ??
     getStringFromPaths(account.copilot_quota_snapshots, [
       ['windsurfCurrentUser', 'email'],
       ['windsurfUserStatus', 'userStatus', 'email'],
@@ -385,21 +379,6 @@ export interface WindsurfQuota {
   weekly_percentage: number;
   weekly_reset_time?: number | null;
   raw_data?: unknown;
-}
-
-function parseTokenMap(token: string): Record<string, string> {
-  const map: Record<string, string> = {};
-  // Windsurf synthetic tokens contain ";sku=" and may have colons in values (e.g. rd=timestamp:0),
-  // so skip the colon-based prefix split for them to avoid losing sku/source fields.
-  const tokenStr = token.includes(';sku=') ? token : (token.split(':')[0] ?? token);
-  for (const part of tokenStr.split(';')) {
-    const eqIdx = part.indexOf('=');
-    if (eqIdx < 0) continue;
-    const key = part.substring(0, eqIdx).trim();
-    if (!key) continue;
-    map[key] = part.substring(eqIdx + 1).trim();
-  }
-  return map;
 }
 
 function isFreeLimitedSku(account: WindsurfAccount, tokenMap: Record<string, string>): boolean {
@@ -568,10 +547,7 @@ function normalizeProtoCreditsValue(value: number | null): number | null {
 }
 
 function parseWindsurfProtoSummary(account: WindsurfAccount): WindsurfProtoSummary | null {
-  const base64Value = getStringFromPaths(account.windsurf_auth_status_raw, [
-    ['userStatusProtoBinaryBase64'],
-    ['userStatusProtoBinary'],
-  ]);
+  const base64Value = account.usage_proto_b64;
   if (!base64Value) return null;
 
   const bytes = decodeBase64ToBytes(base64Value);
@@ -857,7 +833,7 @@ function pickAllowanceResetAt(account: WindsurfAccount): number | null {
       return Math.floor(parsed / 1000);
     }
   }
-  const tokenMap = parseTokenMap(account.copilot_token || '');
+  const tokenMap = account.display_token_claims || {};
   const rd = tokenMap['rd'];
   if (rd) {
     const head = rd.split(':')[0];
@@ -924,7 +900,7 @@ function sumFiniteNumbers(...values: Array<number | null | undefined>): number |
 }
 
 export function getWindsurfUsage(account: WindsurfAccount): WindsurfUsage {
-  const tokenMap = parseTokenMap(account.copilot_token || '');
+  const tokenMap = account.display_token_claims || {};
   const freeLimited = isFreeLimitedSku(account, tokenMap);
 
   // 与 VS Code 扩展口径对齐：付费用户优先使用 quota_snapshots.premium_interactions。

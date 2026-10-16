@@ -1,6 +1,6 @@
 //! Minimal process glue; account injection and client lifecycle remain upstream code.
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+
 use sysinfo::{ProcessRefreshKind, System, UpdateKind};
 
 pub fn is_pid_running(pid: u32) -> bool {
@@ -23,28 +23,7 @@ pub fn close_pid(pid: u32, timeout_secs: u64) -> Result<(), String> {
     if !is_pid_running(pid) {
         return Ok(());
     }
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        let status = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .creation_flags(0x08000000)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| e.to_string())?;
-        if !status.success() && is_pid_running(pid) {
-            return Err("关闭客户端进程失败".into());
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        Command::new("kill")
-            .args(["-15", &pid.to_string()])
-            .status()
-            .map_err(|e| e.to_string())?;
-    }
+    crate::modules::windsurf_instance::request_windsurf_graceful_close(pid);
     let start = std::time::Instant::now();
     while start.elapsed().as_secs() < timeout_secs {
         if !is_pid_running(pid) {
@@ -132,4 +111,21 @@ pub fn detect_windows_exec_path_by_signatures(
         }
     }
     None
+}
+
+/// The file handle owns a cross-process lock until the operation completes.
+pub fn lock_client_operation() -> Result<std::fs::File, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(3);
+    }
+    let file = options
+        .open(crate::modules::account::get_data_dir()?.join("client-operation.lock"))
+        .map_err(|_| "无法创建客户端操作锁，请检查本地目录权限")?;
+    fs2::FileExt::try_lock_exclusive(&file)
+        .map_err(|_| "另一个管理器实例正在操作客户端，请等待其完成后重试")?;
+    Ok(file)
 }

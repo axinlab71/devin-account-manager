@@ -6,11 +6,11 @@
 
 [下载最新版本](https://github.com/axinlab71/devin-account-manager/releases/latest) · [上游 Cockpit Tools](https://github.com/jlcodes99/cockpit-tools) · [许可与署名](NOTICE.md)
 
-![账号列表（合成演示数据）](docs/ui-0.3.2-light.png)
+![账号列表（合成演示数据）](docs/ui-0.4.0-light.png)
 
 从 [Cockpit Tools](https://github.com/jlcodes99/cockpit-tools) 提取的精简 Devin Desktop 账号管理应用。核心账号、导入、刷新和客户端会话注入代码来自原项目，并非重新实现一套协议。
 
-## 使用（0.3.2）
+## 使用（0.4.0 Beta）
 
 1. 打开 Devin Account Manager，点击“添加账号 → 网页授权 → 开始网页授权”。
 2. 在系统浏览器完成目标账号登录。
@@ -29,6 +29,21 @@
 没有注册或接管 `devin://`，没有修改服务端允许列表，也没有伪造新的 client_id。授权凭据不写入 pending 文件、不出现在日志中；保存的账号详情仍使用原有加密格式。
 
 **验证范围：**本地回调、额度解析、加密保存和模拟客户端注入有自动化回归测试覆盖。离线测试与程序成功启动不能代替真实账号的完整登录、在线刷新和两账号切换验证；具体范围见 [docs/VALIDATION.md](docs/VALIDATION.md)。
+
+## 0.4.0 Beta：凭据隔离与切换恢复
+
+- 列表、登录结果、导入结果和刷新结果统一返回安全摘要。保存的 Token、认证原始 JSON 和完整 UserStatus protobuf 保留在 Rust；额度 JSON 与二进制快照仅返回白名单字段。
+- 导入、历史账号刷新、网络请求和客户端注入前校验认证服务器。允许 HTTPS 的精确官方地址：server.codeium.com、server.self-serve.windsurf.com、register.windsurf.com，以及 windsurf.com/_backend。拒绝自定义服务器、用户信息、额外端口、查询和片段；原代理传输逻辑沿用。
+- 关闭客户端使用正常窗口关闭请求，等待超时后中止，提示保存工作和手动关闭；不再自动强制结束进程。通过进程间文件锁阻止多个新版管理器同时操作客户端。
+- 切换前在内存创建完整 SQLite 快照，检查后加密保存；数据库写入后校验或启动失败，会在确认客户端已关闭后尝试恢复。无法安全恢复时保留恢复点并明确提示。
+- 设置 → 数据管理：恢复上一次切换前的完整数据库；清理旧版明文备份。清理需要用户确认，并要求当前加密恢复点通过验证。仅保留最近一次新恢复点。
+- 账号去重优先使用 Devin Account ID + Org ID；同邮箱不同组织分别保存。官方刷新返回其他组织时中止，保留原账号；本版未实现任意组织的在线选择。
+- “最近切换”仅在实际写入并启动客户端后更新；额度失败与凭据状态分开，当前标识只代表本地匹配。网页授权显示回调、凭据处理和保存阶段。
+- 新增 Windows GitHub Actions：构建、Rust 回归、额度解析、界面回归与 NSIS 打包。工具版本和关键 Actions 提交固定。
+
+恢复点绑定当前客户端目录及其加密密钥。恢复会覆盖切换之后的客户端数据库状态，请先保存工作；换目录、换加密密钥或恢复点损坏时会拒绝写入。旧版明文备份不会在升级时自动删除。
+
+**验证范围：**离线故障注入与合成界面验证不代表真实 Devin 账号已完成授权、在线刷新或两账号往返切换。本版保持 Beta 定位，真实验收步骤见 [docs/REAL-ACCOUNT-CHECKLIST.md](docs/REAL-ACCOUNT-CHECKLIST.md)。
 
 ## 0.3.2 三列账号卡片
 

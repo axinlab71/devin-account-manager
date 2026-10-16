@@ -10,7 +10,7 @@ function load(file, deps = {}) {
 }
 const data = load('src/utils/dataExtract.ts');
 const q = load('src/types/windsurf.ts', {'../utils/dataExtract':data});
-const account = { id:'synthetic',github_login:'synthetic',github_id:0,github_access_token:'synthetic',copilot_token:'',created_at:1,last_used:1 };
+const account = { id:'synthetic',github_login:'synthetic',github_id:0,created_at:1,last_used:1 };
 let a={...account,windsurf_plan_status:{billingStrategy:'quota',dailyQuotaRemainingPercent:75,weeklyQuotaRemainingPercent:40,dailyQuotaResetAtUnix:'1900000000'}};
 let usage=q.getWindsurfQuotaUsageSummary(a);assert.equal(usage.dailyUsedPercent,25);assert.equal(usage.weeklyUsedPercent,60);assert.equal(usage.dailyResetAt,1900000000);
 a={...account,windsurf_user_status:{userStatus:{planStatus:{billing_strategy:'quota',daily_quota_remaining_percent:0,weekly_quota_remaining_percent:100}}}};
@@ -27,6 +27,6 @@ console.log('PASS: camel/snake quota; zero versus missing; remaining->used; rese
 function varint(n) { const out=[]; do { let b=n%128;n=Math.floor(n/128);out.push(b+(n ? 128 : 0)); } while(n);return out; }
 const planBytes=[...varint(14*8),100,...varint(15*8),25,...varint(17*8),...varint(1900000000)];
 const proto=Buffer.from([...varint(13*8+2),...varint(planBytes.length),...planBytes]).toString('base64');
-usage=q.getWindsurfQuotaUsageSummary({...account,windsurf_auth_status_raw:{userStatusProtoBinaryBase64:proto}});
+usage=q.getWindsurfQuotaUsageSummary({...account,usage_proto_b64:proto});
 assert.equal(usage.dailyUsedPercent,0);assert.equal(usage.weeklyUsedPercent,75);assert.equal(usage.dailyResetAt,1900000000);
 console.log('PASS: retained binary protobuf quota snapshot; remaining semantics agree with upstream Rust decoder.');

@@ -632,11 +632,11 @@ async fn serve_callback(
                 continue;
             }
 
-            if let Some(error) = error {
+            if let Some(_error) = error {
                 let message = if error_desc.is_empty() {
-                    format!("授权失败: {}", error)
+                    "网页授权未完成或被取消，请重新发起登录。".to_string()
                 } else {
-                    format!("授权失败: {} ({})", error, error_desc)
+                    "网页授权未完成或被取消，请重新发起登录。".to_string()
                 };
                 if let Ok(mut guard) = PENDING_OAUTH_STATE.lock() {
                     if let Some(current) = guard.as_mut() {
@@ -732,6 +732,7 @@ async fn post_seat_management_json_with_agent(
     body: Value,
     agent: &str,
 ) -> Result<Value, String> {
+    crate::modules::auth_endpoint::validate_base(base_url)?;
     let base = base_url.trim().trim_end_matches('/');
     let url = format!(
         "{}/exa.seat_management_pb.SeatManagementService/{}",
@@ -1118,6 +1119,7 @@ async fn build_payload_from_api_key(
     api_server_url_hint: Option<&str>,
 ) -> Result<WindsurfOAuthCompletePayload, String> {
     let api_server_url = resolve_api_server_url(auth_status_raw.as_ref(), api_server_url_hint);
+    crate::modules::auth_endpoint::validate_base(&api_server_url)?;
     let user_status = match get_user_status_by_api_key(&api_server_url, api_key).await {
         Ok(value) => Some(value),
         Err(err) => {
@@ -1344,7 +1346,7 @@ pub fn submit_callback_url(login_id: &str, callback_url: &str) -> Result<(), Str
         return Err("回调 state 校验失败，请确认粘贴的是当前登录会话链接".to_string());
     }
 
-    if let Some(error) = params
+    if let Some(_error) = params
         .get("error")
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
@@ -1355,9 +1357,9 @@ pub fn submit_callback_url(login_id: &str, callback_url: &str) -> Result<(), Str
             .filter(|value| !value.is_empty())
             .unwrap_or_default();
         let message = if error_desc.is_empty() {
-            format!("授权失败: {}", error)
+            "网页授权未完成或被取消，请重新发起登录。".to_string()
         } else {
-            format!("授权失败: {} ({})", error, error_desc)
+            "网页授权未完成或被取消，请重新发起登录。".to_string()
         };
         if let Ok(mut guard) = PENDING_OAUTH_STATE.lock() {
             if let Some(current) = guard.as_mut() {
@@ -1755,8 +1757,7 @@ async fn detect_password_auth_method(
         .await
         .unwrap_or_else(|_| "<no-body>".to_string());
     if !status.is_success() {
-        let detail =
-            parse_error_message_from_body_text(&body_text).unwrap_or_else(|| body_text.clone());
+        let detail = format!("HTTP 认证失败，响应长度 {}", body_text.len());
         return Err(format!(
             "检测账号认证方式失败: HTTP {}{}",
             status.as_u16(),
@@ -1816,8 +1817,7 @@ async fn login_with_auth1_password(email: &str, password: &str) -> Result<String
         if status.as_u16() == 401 || status.as_u16() == 403 {
             return Err("邮箱或密码错误".to_string());
         }
-        let detail =
-            parse_error_message_from_body_text(&body_text).unwrap_or_else(|| body_text.clone());
+        let detail = format!("HTTP 认证失败，响应长度 {}", body_text.len());
         return Err(format!(
             "Devin Auth 登录失败: HTTP {}{}",
             status.as_u16(),
@@ -1893,8 +1893,7 @@ async fn request_auth1_session(auth1_token: &str, org_id: &str) -> Result<Value,
         .await
         .unwrap_or_else(|_| "<no-body>".to_string());
     if !status.is_success() {
-        let detail =
-            parse_error_message_from_body_text(&body_text).unwrap_or_else(|| body_text.clone());
+        let detail = format!("HTTP 认证失败，响应长度 {}", body_text.len());
         return Err(format!(
             "WindsurfPostAuth 失败: HTTP {}{}",
             status.as_u16(),
@@ -2218,7 +2217,7 @@ async fn sign_in_with_firebase_password(email: &str, password: &str) -> Result<S
             "INVALID_PASSWORD" | "INVALID_LOGIN_CREDENTIALS" => "邮箱或密码错误".to_string(),
             "USER_DISABLED" => "账号已被禁用".to_string(),
             "TOO_MANY_ATTEMPTS_TRY_LATER" => "尝试次数过多，请稍后再试".to_string(),
-            _ => format!("Firebase 登录失败: {}", error_msg),
+            _ => "Firebase 登录失败，请稍后重试或重新授权".to_string(),
         };
         return Err(friendly);
     }
@@ -2338,6 +2337,7 @@ pub async fn build_payload_from_local_auth_status(
 pub async fn refresh_payload_for_account(
     account: &WindsurfAccount,
 ) -> Result<WindsurfOAuthCompletePayload, String> {
+    crate::modules::auth_endpoint::validate_account(account)?;
     // ===== Devin 账号: auth1 是长期凭证，优先走完整 4 步链路刷新 =====
     // 这条路径产出真正的机器绑定 ide_token + 新鲜 user_status_proto，
     // IDE 启动后能立即对话；旧的 build_payload_from_auth1_session_token 路径
@@ -2690,4 +2690,16 @@ mod direct_callback_tests {
             .is_empty());
         cleanup(&start.login_id, dir);
     }
+}
+
+pub fn callback_received(login_id: &str) -> bool {
+    PENDING_OAUTH_STATE
+        .lock()
+        .ok()
+        .and_then(|p| {
+            p.as_ref().map(|p| {
+                p.login_id == login_id && (p.access_token.is_some() || p.devin_code.is_some())
+            })
+        })
+        .unwrap_or(false)
 }

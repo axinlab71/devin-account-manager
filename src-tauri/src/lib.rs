@@ -3,17 +3,26 @@ pub mod models;
 pub mod modules;
 #[cfg(test)]
 mod regression_tests;
+#[cfg(test)]
+mod security_tests;
 pub mod utils;
 
-use models::windsurf::{WindsurfAccount, WindsurfOAuthStartResponse};
+use models::windsurf::WindsurfOAuthStartResponse;
+use modules::account_view::{views, AccountView};
 use modules::{windsurf_account as accounts, windsurf_instance as client, windsurf_oauth as auth};
 use serde::Serialize;
 use std::path::Path;
+static LOGIN_PHASE: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+fn login_phase(id: &str, phase: &str) {
+    if let Ok(mut p) = LOGIN_PHASE.lock() {
+        *p = Some((id.into(), phase.into()));
+    }
+}
 static CLIENT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tauri::command]
-fn list_windsurf_accounts() -> Result<Vec<WindsurfAccount>, String> {
-    accounts::list_accounts_checked()
+fn list_windsurf_accounts() -> Result<Vec<AccountView>, String> {
+    accounts::list_accounts_checked().map(views)
 }
 #[tauri::command]
 fn delete_windsurf_account(account_id: String) -> Result<(), String> {
@@ -26,20 +35,22 @@ fn import_cockpit_accounts(
     modules::cockpit_migration::import(source_path)
 }
 #[tauri::command]
-fn import_windsurf_from_json(json_content: String) -> Result<Vec<WindsurfAccount>, String> {
-    accounts::import_from_json(&json_content)
+fn import_windsurf_from_json(json_content: String) -> Result<Vec<AccountView>, String> {
+    accounts::import_from_json(&json_content).map(views)
 }
 #[tauri::command]
 async fn add_windsurf_account_with_token(
     github_access_token: String,
-) -> Result<WindsurfAccount, String> {
+) -> Result<AccountView, String> {
     accounts::upsert_account(auth::build_payload_from_token(&github_access_token).await?)
+        .map(|a| AccountView::from(&a))
 }
 #[tauri::command]
-async fn import_windsurf_from_local() -> Result<Vec<WindsurfAccount>, String> {
+async fn import_windsurf_from_local() -> Result<Vec<AccountView>, String> {
     let _guard = CLIENT_LOCK
         .try_lock()
         .map_err(|_| "正在操作客户端，请稍后再试")?;
+    let _file_guard = modules::process::lock_client_operation()?;
     let mut local = modules::official_browser_login::read_local_login()?
         .ok_or("未找到本机登录态，请先在官方 Devin Desktop 登录")?;
     modules::official_browser_login::remove_observation_metadata(&mut local);
@@ -49,11 +60,13 @@ async fn import_windsurf_from_local() -> Result<Vec<WindsurfAccount>, String> {
             payload.github_login = hint;
         }
     }
-    Ok(vec![accounts::upsert_account(payload)?])
+    Ok(vec![AccountView::from(&accounts::upsert_account(payload)?)])
 }
 #[tauri::command]
-async fn refresh_windsurf_token(account_id: String) -> Result<WindsurfAccount, String> {
-    accounts::refresh_account_token(&account_id).await
+async fn refresh_windsurf_token(account_id: String) -> Result<AccountView, String> {
+    accounts::refresh_account_token(&account_id)
+        .await
+        .map(|a| AccountView::from(&a))
 }
 #[tauri::command]
 async fn windsurf_oauth_login_start() -> Result<WindsurfOAuthStartResponse, String> {
@@ -62,18 +75,61 @@ async fn windsurf_oauth_login_start() -> Result<WindsurfOAuthStartResponse, Stri
         let _ = auth::cancel_login(Some(&response.login_id));
         return Err("无法打开系统浏览器，请检查默认浏览器设置".into());
     }
+    login_phase(&response.login_id, "waiting");
     Ok(response)
 }
 
 #[tauri::command]
-async fn windsurf_oauth_login_poll(login_id: String) -> Result<Option<WindsurfAccount>, String> {
-    match auth::poll_login(&login_id).await? {
-        Some(payload) => Ok(Some(accounts::upsert_account(payload)?)),
-        None => Ok(None),
+async fn windsurf_oauth_login_poll(login_id: String) -> Result<Option<AccountView>, String> {
+    if auth::callback_received(&login_id) {
+        login_phase(&login_id, "verifying");
+    }
+    let result = auth::poll_login(&login_id).await;
+    match result {
+        Ok(Some(payload)) => {
+            login_phase(&login_id, "saving");
+            let saved = accounts::upsert_account(payload);
+            match saved {
+                Ok(a) => {
+                    login_phase(&login_id, "saved");
+                    Ok(Some(AccountView::from(&a)))
+                }
+                Err(e) => {
+                    login_phase(&login_id, "failed");
+                    Err(e)
+                }
+            }
+        }
+        Ok(None) => Ok(None),
+        Err(e) => {
+            login_phase(&login_id, "failed");
+            Err(e)
+        }
     }
 }
 #[tauri::command]
+fn get_oauth_login_phase(login_id: String) -> String {
+    let phase = LOGIN_PHASE
+        .lock()
+        .ok()
+        .and_then(|p| {
+            p.as_ref()
+                .filter(|(id, _)| id == &login_id)
+                .map(|(_, p)| p.clone())
+        })
+        .unwrap_or_else(|| "waiting".into());
+    if phase == "waiting" && auth::callback_received(&login_id) {
+        "callback_received".into()
+    } else {
+        phase
+    }
+}
+
+#[tauri::command]
 fn windsurf_oauth_login_cancel(login_id: String) -> Result<(), String> {
+    if get_oauth_login_phase(login_id.clone()) != "saved" {
+        login_phase(&login_id, "cancelled");
+    }
     auth::cancel_login(Some(&login_id))
 }
 
@@ -83,14 +139,18 @@ async fn official_browser_login_start(
     let _guard = CLIENT_LOCK
         .try_lock()
         .map_err(|_| "正在操作客户端，请稍后再试")?;
+    let _file_guard = modules::process::lock_client_operation()?;
     modules::official_browser_login::start()
 }
 #[tauri::command]
-async fn official_browser_login_poll(login_id: String) -> Result<Option<WindsurfAccount>, String> {
+async fn official_browser_login_poll(login_id: String) -> Result<Option<AccountView>, String> {
     let _guard = CLIENT_LOCK
         .try_lock()
         .map_err(|_| "正在操作客户端，请稍后再试")?;
-    modules::official_browser_login::poll(&login_id).await
+    let _file_guard = modules::process::lock_client_operation()?;
+    modules::official_browser_login::poll(&login_id)
+        .await
+        .map(|a| a.as_ref().map(AccountView::from))
 }
 #[tauri::command]
 fn official_browser_login_cancel(login_id: String) -> Result<(), String> {
@@ -111,20 +171,7 @@ fn current_account_id() -> Option<String> {
         .ok()
         .flatten()?;
     let list = accounts::list_accounts_checked().ok()?;
-    // Compare actual persisted client credentials, never the last-selected UI row.
-    list.into_iter()
-        .find(|a| {
-            ["apiKey", "sessionToken"]
-                .iter()
-                .filter_map(|k| local.get(k).and_then(|v| v.as_str()))
-                .any(|token| {
-                    !token.is_empty()
-                        && (a.windsurf_api_key.as_deref() == Some(token)
-                            || a.windsurf_auth_token.as_deref() == Some(token)
-                            || a.github_access_token == token)
-                })
-        })
-        .map(|a| a.id)
+    modules::account_identity::current_id(&local, &list)
 }
 
 #[tauri::command]
@@ -143,6 +190,7 @@ fn get_client_status() -> Result<ClientStatus, String> {
 #[tauri::command]
 async fn open_official_client() -> Result<String, String> {
     let _guard = CLIENT_LOCK.try_lock().map_err(|_| "正在操作客户端")?;
+    let _file_guard = modules::process::lock_client_operation()?;
     client::detect_and_save_windsurf_launch_path(false)
         .ok_or("未找到 Devin Desktop，请安装客户端或设置程序路径")?;
     client::start_windsurf_default_with_args_with_new_window(&[], true)?;
@@ -179,6 +227,7 @@ async fn inject_windsurf_to_vscode(account_id: String) -> Result<SwitchResult, S
     let _guard = CLIENT_LOCK
         .try_lock()
         .map_err(|_| "正在操作客户端，请稍后再试")?;
+    let _file_guard = modules::process::lock_client_operation()?;
     client::detect_and_save_windsurf_launch_path(false)
         .ok_or("未找到 Devin Desktop，请先安装或设置路径")?;
     client::ensure_windsurf_launch_path_configured()?;
@@ -198,27 +247,81 @@ async fn inject_windsurf_to_vscode(account_id: String) -> Result<SwitchResult, S
     if !db.is_file() {
         return Err("请先启动官方客户端完成初始化和登录".into());
     }
+    modules::auth_endpoint::validate_account(
+        &accounts::load_account(&account_id).ok_or("账号不存在")?,
+    )?;
+    let was_running = client::profile_is_running(&profile);
     client::close_windsurf(&[profile.to_string_lossy().into_owned()], 20)?;
-    let backup_dir = modules::account::get_data_dir()?.join("client-backups");
-    std::fs::create_dir_all(&backup_dir).map_err(|e| e.to_string())?;
-    let backup = backup_dir.join(format!("state-{}.vscdb", uuid::Uuid::new_v4()));
-    let source = rusqlite::Connection::open(&db).map_err(|e| e.to_string())?;
-    source
-        .backup(rusqlite::DatabaseName::Main, &backup, None)
-        .map_err(|e| format!("备份失败，未修改登录态：{}", e))?;
-    drop(source);
-    client::inject_account_to_profile(&profile, &account_id)?;
-    let verified = current_account_id().as_deref() == Some(&account_id);
-    if !verified {
-        return Err("客户端本地登录态校验失败；已保留切换前数据库备份".into());
-    }
-    client::start_windsurf_default_with_args_with_new_window(&[], true)
-        .map_err(|e| format!("登录态已写入且本地校验通过，但客户端启动失败：{}", e))?;
+    let result = modules::client_recovery::guarded_with_close(
+        &profile,
+        || {
+            client::inject_account_to_profile(&profile, &account_id)?;
+            if current_account_id().as_deref() != Some(&account_id) {
+                return Err("客户端本地登录态校验失败".into());
+            }
+            client::start_windsurf_default_with_args_with_new_window(&[], true)?;
+            Ok(())
+        },
+        || client::close_windsurf(&[profile.to_string_lossy().into_owned()], 20),
+    );
+    let backup = match result {
+        Ok(p) => p,
+        Err(error) => {
+            if was_running && error.safe_to_restart && !client::profile_is_running(&profile) {
+                if client::start_windsurf_default_with_args_with_new_window(&[], true).is_err() {
+                    return Err(format!("{}；请手动启动客户端。", error.message));
+                }
+            }
+            return Err(error.message);
+        }
+    };
+    let verified = true;
+    let message = if accounts::mark_switched(&account_id).is_ok() {
+        "已写入目标账号并启动客户端，请在 Devin Desktop 确认账号及服务连接。"
+    } else {
+        "账号已写入并启动，但最近切换记录未能保存；请检查本地目录权限。"
+    };
     Ok(SwitchResult {
-        message: "已写入目标账号并启动客户端，请在 Devin Desktop 确认账号及服务连接。".into(),
+        message: message.into(),
         local_verified: verified,
         backup_path: backup.to_string_lossy().into_owned(),
     })
+}
+
+#[tauri::command]
+fn get_recovery_status() -> Result<modules::client_recovery::Status, String> {
+    modules::client_recovery::status()
+}
+#[tauri::command]
+async fn restore_last_client_state() -> Result<String, String> {
+    let _guard = CLIENT_LOCK
+        .try_lock()
+        .map_err(|_| "正在操作客户端，请稍后再试")?;
+    let _file_guard = modules::process::lock_client_operation()?;
+    let profile = client::get_default_windsurf_user_data_dir()?;
+    modules::client_recovery::preflight(&profile)?;
+    let was_running = client::profile_is_running(&profile);
+    client::close_windsurf(&[profile.to_string_lossy().into_owned()], 20)?;
+    modules::client_recovery::restore(&profile).map_err(|e| format!("恢复未完成，客户端保持关闭；恢复点仍保留：{e}"))?;
+    if was_running {
+        let restart = client::start_windsurf_default_with_args_with_new_window(&[], true);
+        if restart.is_err() {
+            return Err("恢复操作结束，但客户端启动失败；请手动启动并检查账号".into());
+        }
+    }
+    if let Some(id) = current_account_id() {
+        let _ = accounts::mark_switched(&id);
+    }
+    Ok("已恢复上一次切换前的数据库，请在客户端确认账号。".into())
+}
+
+#[tauri::command]
+fn cleanup_legacy_client_backups() -> Result<usize, String> {
+    let _guard = CLIENT_LOCK
+        .try_lock()
+        .map_err(|_| "正在操作客户端，请稍后再试")?;
+    let _file_guard = modules::process::lock_client_operation()?;
+    modules::client_recovery::cleanup_legacy(&client::get_default_windsurf_user_data_dir()?)
 }
 
 pub fn run() {
@@ -238,6 +341,10 @@ pub fn run() {
             official_browser_login_poll,
             official_browser_login_cancel,
             get_client_status,
+            get_recovery_status,
+            cleanup_legacy_client_backups,
+            get_oauth_login_phase,
+            restore_last_client_state,
             open_official_client,
             set_client_path,
             inject_windsurf_to_vscode

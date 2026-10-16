@@ -1743,7 +1743,7 @@ fn wait_windsurf_pids_exit(pids: &[u32], timeout_secs: u64) -> bool {
     }
 }
 
-fn request_windsurf_graceful_close(pid: u32) {
+pub(crate) fn request_windsurf_graceful_close(pid: u32) {
     if pid == 0 || !modules::process::is_pid_running(pid) {
         return;
     }
@@ -1781,41 +1781,22 @@ tell application \"System Events\" to keystroke \"q\" using command down",
     }
 
     #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-
-        modules::logger::log_info(&format!(
-            "[Windsurf Close] graceful taskkill start pid={}",
-            pid
-        ));
-        let output = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T"])
-            .creation_flags(0x08000000)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .output();
-        match output {
-            Ok(value) => {
-                if value.status.success() {
-                    modules::logger::log_info(&format!(
-                        "[Windsurf Close] graceful taskkill success pid={} status={}",
-                        pid, value.status
-                    ));
-                } else {
-                    modules::logger::log_warn(&format!(
-                        "[Windsurf Close] graceful taskkill failed pid={} status={}",
-                        pid, value.status
-                    ));
-                }
+    unsafe {
+        use windows::Win32::{
+            Foundation::{BOOL, HWND, LPARAM, WPARAM},
+            UI::WindowsAndMessaging::{
+                EnumWindows, GetWindowThreadProcessId, PostMessageW, WM_CLOSE,
+            },
+        };
+        unsafe extern "system" fn close_window(hwnd: HWND, param: LPARAM) -> BOOL {
+            let mut owner = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut owner));
+            if owner == param.0 as u32 {
+                let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
             }
-            Err(err) => {
-                modules::logger::log_warn(&format!(
-                    "[Windsurf Close] graceful taskkill error pid={} err={}",
-                    pid, err
-                ));
-            }
+            BOOL(1)
         }
+        let _ = EnumWindows(Some(close_window), LPARAM(pid as isize));
     }
 
     #[cfg(target_os = "linux")]
@@ -1865,55 +1846,8 @@ pub fn close_windsurf(user_data_dirs: &[String], timeout_secs: u64) -> Result<()
     for pid in &pids {
         request_windsurf_graceful_close(*pid);
     }
-    if wait_windsurf_pids_exit(&pids, 2) {
-        modules::logger::log_info(&format!(
-            "[Windsurf Close] graceful close finished, targets={}",
-            modules::process::summarize_pid_list_for_log(&pids)
-        ));
-        return Ok(());
-    }
-
-    for pid in &pids {
-        if let Err(err) = modules::process::close_pid(*pid, timeout_secs) {
-            modules::logger::log_warn(&format!(
-                "[Windsurf Close] close_pid returned error pid={} err={}",
-                pid, err
-            ));
-        }
-    }
-
-    let mut remaining_entries = filter_windsurf_entries_by_target_dirs(
-        collect_windsurf_process_entries(),
-        &target_dirs,
-        default_dir.as_deref(),
-    );
-    if !remaining_entries.is_empty() {
-        let remaining_pids = collect_windsurf_remaining_pids(&remaining_entries);
-        modules::logger::log_warn(&format!(
-            "[Windsurf Close] first remaining pids after close={}",
-            modules::process::summarize_pid_list_for_log(&remaining_pids)
-        ));
-        for pid in &remaining_pids {
-            if let Err(err) = modules::process::close_pid(*pid, 6) {
-                modules::logger::log_warn(&format!(
-                    "[Windsurf Close] retry close_pid returned error pid={} err={}",
-                    pid, err
-                ));
-            }
-        }
-        remaining_entries = filter_windsurf_entries_by_target_dirs(
-            collect_windsurf_process_entries(),
-            &target_dirs,
-            default_dir.as_deref(),
-        );
-    }
-
-    if !remaining_entries.is_empty() {
-        let remaining_pids = collect_windsurf_remaining_pids(&remaining_entries);
-        return Err(format!(
-            "无法关闭受管 Windsurf 实例进程，请手动关闭后重试: {}",
-            modules::process::summarize_pid_list_for_log(&remaining_pids)
-        ));
+    if !wait_windsurf_pids_exit(&pids, timeout_secs) {
+        return Err("客户端尚未退出。请保存工作并手动关闭 Devin Desktop 后重试；未修改登录态，也未强制结束进程。".into());
     }
 
     Ok(())
@@ -1970,6 +1904,7 @@ fn ensure_state_db_for_injection(profile_dir: &Path) -> Result<PathBuf, String> 
 pub fn inject_account_to_profile(profile_dir: &Path, account_id: &str) -> Result<(), String> {
     let account = windsurf_account::load_account(account_id)
         .ok_or_else(|| format!("绑定账号不存在: {}", account_id))?;
+    modules::auth_endpoint::validate_account(&account)?;
     let db_path = ensure_state_db_for_injection(profile_dir)?;
     let conn = Connection::open(&db_path).map_err(|e| format!("打开数据库失败: {}", e))?;
 
@@ -2239,4 +2174,15 @@ mod tests {
         assert_eq!(picked, devin);
         let _ = fs::remove_dir_all(root);
     }
+}
+
+pub fn profile_is_running(profile: &Path) -> bool {
+    let target =
+        std::collections::HashSet::from([normalize_path_for_compare(&profile.to_string_lossy())]);
+    !select_windsurf_main_pids_by_target_dirs(
+        &collect_windsurf_process_entries(),
+        &target,
+        Some(&normalize_path_for_compare(&profile.to_string_lossy())),
+    )
+    .is_empty()
 }

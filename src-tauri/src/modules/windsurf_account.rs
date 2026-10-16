@@ -266,11 +266,28 @@ fn refresh_summary(index: &mut WindsurfAccountIndex, account: &WindsurfAccount) 
     index.accounts.push(account.summary());
 }
 
-fn upsert_account_record(account: WindsurfAccount) -> Result<WindsurfAccount, String> {
+fn upsert_account_record(mut account: WindsurfAccount) -> Result<WindsurfAccount, String> {
     let _lock = WINDSURF_ACCOUNT_INDEX_LOCK
         .lock()
         .map_err(|_| "获取 Windsurf 账号锁失败".to_string())?;
     let mut index = load_account_index();
+    if let Some(existing) = load_account(&account.id) {
+        if !crate::modules::account_identity::same(&existing, &account) {
+            account.id = crate::modules::account_identity::scoped_id(
+                &account.id,
+                crate::modules::account_identity::scope(&account).0,
+                crate::modules::account_identity::scope(&account).1,
+            );
+            if account.id == existing.id {
+                return Err("账号 ID 冲突，已保留已有账号".into());
+            }
+            if let Some(other) = load_account(&account.id) {
+                if !crate::modules::account_identity::same(&other, &account) {
+                    return Err("账号身份冲突，未覆盖已有账号".into());
+                }
+            }
+        }
+    }
     save_account_file(&account)?;
     refresh_summary(&mut index, &account);
     save_account_index(&index)?;
@@ -455,7 +472,7 @@ fn merge_account_group(group: Vec<WindsurfAccount>) -> WindsurfAccount {
 
     let mut merged = group
         .iter()
-        .max_by_key(|account| account.last_used)
+        .max_by_key(|account| account.credentials_updated_at.unwrap_or(account.last_used))
         .cloned()
         .unwrap_or_else(|| group[0].clone());
 
@@ -523,15 +540,13 @@ fn deduplicate_accounts_by_identity_with_index(index: WindsurfAccountIndex) -> R
 
     let mut groups: Vec<Vec<WindsurfAccount>> = Vec::new();
     for account in accounts {
-        // 仅按 github_id 分组合并，同邮箱不同 github_id 不合并
         let mut matched_indices: Vec<usize> = groups
             .iter()
             .enumerate()
             .filter(|(_, group)| {
-                group.iter().any(|existing| {
-                    existing.github_id == account.github_id
-                        && account_apis_are_compatible(&account, existing)
-                })
+                group
+                    .iter()
+                    .any(|existing| crate::modules::account_identity::same(existing, &account))
             })
             .map(|(idx, _)| idx)
             .collect();
@@ -695,7 +710,23 @@ fn apply_payload(account: &mut WindsurfAccount, payload: WindsurfOAuthCompletePa
     account.windsurf_user_status = payload.windsurf_user_status;
     account.windsurf_plan_status = payload.windsurf_plan_status;
     account.windsurf_auth_status_raw = payload.windsurf_auth_status_raw;
-    account.last_used = now_ts();
+    account.windsurf_token_type = payload
+        .windsurf_token_type
+        .or(account.windsurf_token_type.clone());
+    account.devin_auth1_token = payload
+        .devin_auth1_token
+        .or(account.devin_auth1_token.clone());
+    account.devin_account_id = payload
+        .devin_account_id
+        .or(account.devin_account_id.clone());
+    account.devin_org_id = payload.devin_org_id.or(account.devin_org_id.clone());
+    account.devin_session_token = payload
+        .devin_session_token
+        .or(account.devin_session_token.clone());
+    account.devin_user_status_proto_b64 = payload
+        .devin_user_status_proto_b64
+        .or(account.devin_user_status_proto_b64.clone());
+    account.credentials_updated_at = Some(now_ts());
 }
 
 fn value_has_number_like(value: &Value) -> bool {
@@ -872,6 +903,9 @@ pub fn upsert_account(payload: WindsurfOAuthCompletePayload) -> Result<WindsurfA
     let _lock = WINDSURF_ACCOUNT_INDEX_LOCK
         .lock()
         .map_err(|_| "获取 Windsurf 账号锁失败".to_string())?;
+    crate::modules::auth_endpoint::validate_json(
+        &serde_json::json!({"windsurf_api_server_url":payload.windsurf_api_server_url,"auth":payload.windsurf_auth_status_raw}),
+    )?;
     if let Err(err) = deduplicate_accounts_by_identity() {
         logger::log_warn(&format!("Windsurf upsert 前去重失败（已忽略）：{}", err));
     }
@@ -879,7 +913,6 @@ pub fn upsert_account(payload: WindsurfOAuthCompletePayload) -> Result<WindsurfA
     let now = now_ts();
     let mut index = load_account_index();
     let normalized_login = normalize_login(&payload);
-    let payload_api_key = resolve_payload_api_key(&payload);
     // lgtm[rs/weak-cryptographic-algorithm] 仅用于生成本地稳定账号 ID（非密码学用途，不参与认证/签名/加密）
     let generated_id = format!(
         "windsurf_{:x}",
@@ -887,25 +920,17 @@ pub fn upsert_account(payload: WindsurfOAuthCompletePayload) -> Result<WindsurfA
     );
 
     // 以 github_id 唯一标识区分账号，同邮箱不同 GitHub 账号不合并
+    let generated_id = crate::modules::account_identity::scoped_id(
+        &generated_id,
+        crate::modules::account_identity::payload_scope(&payload).0,
+        crate::modules::account_identity::payload_scope(&payload).1,
+    );
     let account_id = index
         .accounts
         .iter()
         .filter_map(|item| load_account(&item.id))
-        .find(|account| {
-            if account.github_id != payload.github_id {
-                return false;
-            }
-            if let (Some(incoming_api), Some(existing_api)) = (
-                payload_api_key.as_ref(),
-                resolve_account_api_key(account).as_ref(),
-            ) {
-                if incoming_api != existing_api {
-                    return false;
-                }
-            }
-            true
-        })
-        .map(|account| account.id)
+        .find(|a| crate::modules::account_identity::matches_payload(a, &payload))
+        .map(|a| a.id)
         .unwrap_or(generated_id);
 
     let existing = load_account(&account_id);
@@ -948,6 +973,8 @@ pub fn upsert_account(payload: WindsurfOAuthCompletePayload) -> Result<WindsurfA
         devin_user_status_proto_b64: payload.devin_user_status_proto_b64.clone(),
         created_at,
         last_used: now,
+        last_switched_at: None,
+        credentials_updated_at: Some(now),
     });
 
     let fresh_quota = has_quota_data(&payload);
@@ -959,7 +986,7 @@ pub fn upsert_account(payload: WindsurfOAuthCompletePayload) -> Result<WindsurfA
     account.created_at = created_at;
     account.quota_query_last_error = None;
     account.quota_query_last_error_at = None;
-    account.last_used = now;
+    account.credentials_updated_at = Some(now);
 
     save_account_file(&account)?;
     refresh_summary(&mut index, &account);
@@ -990,6 +1017,7 @@ async fn refresh_account_token_once(account_id: &str) -> Result<WindsurfAccount,
             return Err(err);
         }
     };
+    crate::modules::account_identity::validate_refresh(&account, &payload)?;
     let preserved_quota = merge_refresh_payload_with_existing(&account, &mut payload);
     if preserved_quota {
         logger::log_warn(&format!(
@@ -1011,7 +1039,7 @@ async fn refresh_account_token_once(account_id: &str) -> Result<WindsurfAccount,
         account.quota_query_last_error = Some("未获取到有效配额快照，已保留旧配额缓存".to_string());
         account.quota_query_last_error_at = Some(chrono::Utc::now().timestamp_millis());
     }
-    account.last_used = refreshed_at;
+    account.credentials_updated_at = Some(refreshed_at);
 
     let updated = account.clone();
     upsert_account_record(account)?;
@@ -1111,19 +1139,26 @@ pub fn remove_accounts(account_ids: &[String]) -> Result<(), String> {
 pub fn update_account_tags(account_id: &str, tags: Vec<String>) -> Result<WindsurfAccount, String> {
     let mut account = load_account(account_id).ok_or_else(|| "账号不存在".to_string())?;
     account.tags = Some(tags);
-    account.last_used = now_ts();
     let updated = account.clone();
     upsert_account_record(account)?;
     Ok(updated)
 }
 
 pub fn import_from_json(json_content: &str) -> Result<Vec<WindsurfAccount>, String> {
+    if json_content.len() > 5 * 1024 * 1024 {
+        return Err("JSON 文件不能超过 5 MB".into());
+    }
+    let value: Value = serde_json::from_str(json_content).map_err(|_| "无法解析 JSON 内容")?;
+    crate::modules::auth_endpoint::validate_json(&value)?;
     if let Ok(account) = serde_json::from_str::<WindsurfAccount>(json_content) {
         let saved = upsert_account_record(account)?;
         return Ok(vec![saved]);
     }
 
     if let Ok(accounts) = serde_json::from_str::<Vec<WindsurfAccount>>(json_content) {
+        for a in &accounts {
+            validate_account_id(&a.id)?;
+        }
         let mut result = Vec::new();
         for account in accounts {
             let saved = upsert_account_record(account)?;
@@ -1293,4 +1328,13 @@ mod quota_snapshot_tests {
         assert!(merge_refresh_payload_with_existing(&account, &mut payload));
         assert_eq!(payload.windsurf_plan_status, account.windsurf_plan_status);
     }
+}
+
+pub fn mark_switched(id: &str) -> Result<(), String> {
+    let mut a = load_account(id).ok_or("账号不存在")?;
+    let now = now_ts();
+    a.last_used = now;
+    a.last_switched_at = Some(now);
+    upsert_account_record(a)?;
+    Ok(())
 }

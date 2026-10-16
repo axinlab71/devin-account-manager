@@ -1,7 +1,11 @@
 pub mod account;
+pub mod account_identity;
 pub mod account_index_repair;
+pub mod account_view;
 pub mod atomic_write;
+pub mod auth_endpoint;
 pub mod auth_transport;
+pub mod client_recovery;
 pub mod client_version;
 pub mod cockpit_migration;
 pub mod config;

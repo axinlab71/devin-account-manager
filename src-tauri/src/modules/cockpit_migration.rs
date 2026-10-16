@@ -72,15 +72,10 @@ pub fn import(source_path: Option<String>) -> Result<MigrationReport, String> {
                 continue;
             }
         };
-        if existing.iter().any(|a| {
-            a.id == account.id
-                || (a.github_id > 0 && a.github_id == account.github_id)
-                || a.github_email
-                    .as_ref()
-                    .filter(|s| !s.is_empty())
-                    .zip(account.github_email.as_ref())
-                    .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
-        }) {
+        if existing
+            .iter()
+            .any(|a| crate::modules::account_identity::same(a, &account))
+        {
             report.skipped += 1;
             continue;
         }

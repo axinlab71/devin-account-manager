@@ -1,6 +1,6 @@
 [package]
 name = "devin-account-manager"
-version = "0.3.2"
+version = "0.4.0"
 description = "Devin Desktop account manager extracted from Cockpit Tools"
 authors = ["jlcodes", "Devin Account Manager contributors"]
 license = "CC-BY-NC-SA-4.0"
@@ -22,7 +22,7 @@ chrono = "0.4"
 dirs = "5"
 reqwest = { version = "0.12", features = ["json", "gzip", "brotli", "deflate", "socks"] }
 tokio = { version = "1", features = ["full"] }
-rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+rusqlite = { version = "0.32", features = ["bundled", "backup", "serialize"] }
 base64 = "0.22"
 rand = "0.8"
 sha2 = "0.10"
