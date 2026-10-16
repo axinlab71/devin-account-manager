@@ -6,7 +6,7 @@
       "source": "src-tauri/src/modules/windsurf_oauth.rs",
       "target": "src-tauri/src/modules/windsurf_oauth.rs",
       "source_sha256": "924a89a97450f650415022c7f109b6b4ed534e6dd238db16633d58bea82a2ebc",
-      "final_sha256": "7b72d9013aa0ed0fb536d83de29a5a68f30d369e01f946829858f9163c7ddf94",
+      "final_sha256": "7209bcc27ba98b2fa7a6a1a58c8e9a17a81c5c6549b9662c0d59756943caf65d",
       "modified": true
     },
     {
@@ -20,7 +20,7 @@
       "source": "src-tauri/src/modules/windsurf_account.rs",
       "target": "src-tauri/src/modules/windsurf_account.rs",
       "source_sha256": "6708dac258b054458f9acb2d161c75ab7d494effa100ff17b34d4fcfbfc2a2bc",
-      "final_sha256": "b13f3ca7f1bc886575199d5fae2cd95cf36cce6b2d553685c726ac68a929421e",
+      "final_sha256": "05af9b37908d9aeb8ce2d5630a9380903d2bd3e7838b574d9f2592d30e3c1fe5",
       "modified": true
     },
     {
@@ -118,7 +118,7 @@
       "source": "src/types/windsurf.ts",
       "target": "src/types/windsurf.ts",
       "source_sha256": "9759521624a5c20cd5cbeea642831e522d754379803b52aeff498ad6ab96d1b2",
-      "final_sha256": "a475a41a73c10487692a4c2f16267b503100256711ba9922060a0456b5610b2e",
+      "final_sha256": "b4dad6aa6ade5aa7c6e8610c176de73513b247810b1623be35b06d5563bc56a1",
       "modified": true
     },
     {
@@ -129,7 +129,7 @@
       "modified": true
     }
   ],
-  "derivative_version": "0.2.0",
+  "derivative_version": "0.2.1",
   "new_auth_module": {
     "path": "src-tauri/src/modules/official_browser_login.rs",
     "sha256": "002a255e09ab56d04c55358667fa77f02ca51a5f9384059db0ba564141d9c9b8",

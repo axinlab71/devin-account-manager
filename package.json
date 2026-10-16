@@ -1,13 +1,14 @@
 {
   "name": "devin-account-manager",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "license": "CC-BY-NC-SA-4.0",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "build": "tsc && vite build",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:quota": "node scripts/test-quota.cjs"
   },
   "dependencies": {
     "@tauri-apps/api": "~2.12.4",

@@ -40,6 +40,7 @@ export interface WindsurfAccount {
   quota_query_last_error?: string | null;
   quota_query_last_error_at?: number | null;
 
+  usage_updated_at?: number | null;
   created_at: number;
   last_used: number;
 

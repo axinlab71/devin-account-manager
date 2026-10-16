@@ -6,11 +6,11 @@
 
 [下载最新版本](https://github.com/sxxxxxxxxxxxxxxxxxxxxx/devin-account-manager/releases/latest) · [上游 Cockpit Tools](https://github.com/jlcodes99/cockpit-tools) · [许可与署名](NOTICE.md)
 
-![账号列表（合成演示数据）](docs/ui-0.2.0-dark-list.png)
+![账号列表（合成演示数据）](docs/ui-0.2.1-dark-list.png)
 
 从 [Cockpit Tools](https://github.com/jlcodes99/cockpit-tools) 提取的精简 Devin Desktop 账号管理应用。核心账号、导入、刷新和客户端会话注入代码来自原项目，并非重新实现一套协议。
 
-## 使用（0.2.0）
+## 使用（0.2.1）
 
 1. 打开 Devin Account Manager，点击“添加账号 → 网页授权 → 开始网页授权”。
 2. 在系统浏览器完成目标账号登录。
@@ -28,7 +28,17 @@
 
 没有注册或接管 `devin://`，没有修改服务端允许列表，也没有伪造新的 client_id。授权凭据不写入 pending 文件、不出现在日志中；保存的账号详情仍使用原有加密格式。
 
-**安全与可靠性保障：**采用本机 loopback listener 与 fragment 凭据安全中继机制，配合 32 项自动化后端回归测试及严格类型验证，确保凭据流转安全脱敏、原子事务写入以及数据解密可靠。详细测试覆盖记录见 [docs/VALIDATION.md](docs/VALIDATION.md)。
+**验证范围：**本地回调、额度解析、加密保存和模拟客户端注入有自动化回归测试覆盖。离线测试与程序成功启动不能代替真实账号的完整登录、在线刷新和两账号切换验证；具体范围见 [docs/VALIDATION.md](docs/VALIDATION.md)。
+
+## 0.2.1 可靠性完善
+
+- 额度展示已保存的更新时间；旧缓存无时间时明确标记，不将未检查账号显示为在线正常。
+- 后端仅把有效数字额度视作新快照，空对象/仅身份信息/无效数值不会覆盖旧额度或更新其时间；剩余零仍属于有效数据。
+- 批量刷新显示完成进度，可停止后续任务；已开始的请求正常结束，成功账号立即更新。
+- 客户端状态读取失败不会隐藏账号列表；本地账号读取失败提供重试，避免误显示为无账号。
+- 刷新失败时额度明确标为上次数据，仍保留原有网页授权、Token/JSON 导入与切换协议。
+
+开发验证：`npm run test:quota`，Rust 回归测试与界面测试命令见下文。
 
 ## 0.2.0 额度与布局
 

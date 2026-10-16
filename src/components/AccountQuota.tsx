@@ -15,18 +15,19 @@ function Meter({ label, remaining, detail, reset }: {label: string; remaining: n
     {reset ? <small>{resetLabel(reset)}</small> : null}
   </div>;
 }
-export const AccountQuota = memo(function AccountQuota({ account }: {account: WindsurfAccount}) {
+export const AccountQuota = memo(function AccountQuota({ account, refreshFailed = false }: {account: WindsurfAccount; refreshFailed?: boolean}) {
   const quota = getWindsurfQuotaUsageSummary(account);
   const credits = getWindsurfCreditsSummary(account);
   const quotaMode = getWindsurfOfficialUsageMode(account) === 'quota' || quota.dailyUsedPercent != null || quota.weeklyUsedPercent != null;
   const creditKnown = credits.promptCreditsLeft != null || credits.addOnCredits != null;
-  const cached = Boolean(account.quota_query_last_error);
+  const cached = Boolean(account.quota_query_last_error) || refreshFailed;
   const quotaKnown = quota.dailyUsedPercent != null || quota.weeklyUsedPercent != null;
   const left = credits.promptCreditsLeft;
   const total = credits.promptCreditsTotal;
   const percent = left != null && total != null && total > 0 ? left / total * 100 : null;
-  return <div className="account-quota" aria-label="使用额度"><div className="quota-caption"><span>使用额度</span><span>{cached ? (quotaKnown || creditKnown ? '已缓存数据' : '待更新') : quotaMode ? '日 / 周限额' : creditKnown ? 'Credits' : '就绪'}</span></div>
+  return <div className="account-quota" aria-label="使用额度"><div className="quota-caption"><span>使用额度</span><span>{cached ? (quotaKnown || creditKnown ? '刷新失败 · 上次数据' : '额度查询失败') : quotaMode ? '日 / 周限额' : creditKnown ? 'Credits' : '尚未获取'}</span></div>
     {quotaMode ? <div className="quota-meters"><Meter label="每日额度" remaining={quota.dailyUsedPercent == null ? null : 100 - quota.dailyUsedPercent} reset={quota.dailyResetAt}/><Meter label="每周额度" remaining={quota.weeklyUsedPercent == null ? null : 100 - quota.weeklyUsedPercent} reset={quota.weeklyResetAt}/></div> : creditKnown ? <><Meter label="月度 Credits" remaining={percent} detail={left == null ? '暂无数据' : `剩余 ${number(left)}${total == null ? '' : ` / ${number(total)}`}`} reset={credits.planEndsAt}/>{credits.addOnCredits != null ? <div className="extra-credits"><span>加购 Credits</span><strong>{number(credits.addOnCredits)}</strong></div> : null}</> : <div className="quota-empty">暂无额度数据<span>点击刷新，获取最新使用情况</span></div>}
+    {account.usage_updated_at ? <div className="quota-updated" title={new Date(account.usage_updated_at * 1000).toLocaleString('zh-CN')}>更新于 {new Date(account.usage_updated_at * 1000).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}</div> : (quotaKnown || creditKnown) ? <div className="quota-updated">缓存数据 · 更新时间未知</div> : null}
   </div>;
 });
 export function accountPlan(account: WindsurfAccount) { return getWindsurfResolvedPlanLabel(account) || account.copilot_plan || '计划未知'; }

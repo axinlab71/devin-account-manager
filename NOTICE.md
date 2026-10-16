@@ -27,3 +27,5 @@ See `docs/PROVENANCE.json` for source paths and hashes before modification. Shar
 0.1.5：新增认证传输层，在连接建立失败时单次直连尝试，保留上游请求载荷、认证端点与 User-Agent；添加脱敏错误类别和网络回归测试。
 
 0.2.0：产品更名为 Devin Account Manager，兼容原存储与应用标识；复用上游 src/types/windsurf.ts 和 src/utils/dataExtract.ts，修正缺失额度处理及二进制快照已用/剩余方向，新增额度展示与回归测试，精简布局和限时成功提示。
+
+v0.2.1（2026-10-16）：收紧额度快照有效性与缓存保留，展示原有 usage_updated_at 字段；新增批量进度/停止后续任务和读取故障恢复，修正状态与验证范围说明。授权和客户端注入协议保持原实现。

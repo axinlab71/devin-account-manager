@@ -1,6 +1,6 @@
 [package]
 name = "devin-account-manager"
-version = "0.2.0"
+version = "0.2.1"
 description = "Devin Desktop account manager extracted from Cockpit Tools"
 authors = ["jlcodes", "Devin Account Manager contributors"]
 license = "CC-BY-NC-SA-4.0"

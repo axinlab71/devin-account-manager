@@ -703,7 +703,7 @@ fn value_has_number_like(value: &Value) -> bool {
         || value
             .as_str()
             .and_then(|text| text.trim().parse::<f64>().ok())
-            .is_some()
+            .is_some_and(f64::is_finite)
 }
 
 fn status_has_credit_fields(status: Option<&Value>) -> bool {
@@ -739,23 +739,56 @@ fn status_has_credit_fields(status: Option<&Value>) -> bool {
 }
 
 fn status_has_plan_snapshot(status: Option<&Value>) -> bool {
-    let Some(value) = status else {
-        return false;
-    };
-
-    value.as_object().is_some()
-        || value.get("planStatus").and_then(Value::as_object).is_some()
-        || value
-            .get("userStatus")
-            .and_then(|user_status| user_status.get("planStatus"))
-            .and_then(Value::as_object)
-            .is_some()
+    fn contains_quota(value: &Value, depth: usize) -> bool {
+        if depth > 8 {
+            return false;
+        }
+        let Some(object) = value.as_object() else {
+            return false;
+        };
+        const KEYS: &[&str] = &[
+            "entitlement",
+            "percent_remaining",
+            "completions",
+            "chat",
+            "dailyQuotaRemainingPercent",
+            "daily_quota_remaining_percent",
+            "weeklyQuotaRemainingPercent",
+            "weekly_quota_remaining_percent",
+            "availablePromptCredits",
+            "available_prompt_credits",
+            "usedPromptCredits",
+            "used_prompt_credits",
+            "availableFlowCredits",
+            "available_flow_credits",
+            "usedFlowCredits",
+            "used_flow_credits",
+            "availableFlexCredits",
+            "available_flex_credits",
+            "usedFlexCredits",
+            "used_flex_credits",
+            "availableAddOnCredits",
+            "available_add_on_credits",
+            "availableTopUpCredits",
+            "available_top_up_credits",
+            "monthlyPromptCredits",
+            "monthly_prompt_credits",
+            "monthlyFlexCreditPurchaseAmount",
+            "monthly_flex_credit_purchase_amount",
+        ];
+        object.iter().any(|(key, value)| {
+            (KEYS.contains(&key.as_str()) && value_has_number_like(value))
+                || contains_quota(value, depth + 1)
+        })
+    }
+    status.is_some_and(|value| contains_quota(value, 0))
 }
 
 fn has_quota_data(payload: &WindsurfOAuthCompletePayload) -> bool {
     status_has_credit_fields(payload.copilot_limited_user_quotas.as_ref())
         || status_has_plan_snapshot(payload.windsurf_plan_status.as_ref())
         || status_has_plan_snapshot(payload.windsurf_user_status.as_ref())
+        || status_has_plan_snapshot(payload.copilot_quota_snapshots.as_ref())
 }
 
 fn merge_refresh_payload_with_existing(
@@ -774,10 +807,10 @@ fn merge_refresh_payload_with_existing(
         if payload.copilot_plan.is_none() {
             payload.copilot_plan = account.copilot_plan.clone();
         }
-        if payload.windsurf_plan_status.is_none() {
+        if !status_has_plan_snapshot(payload.windsurf_plan_status.as_ref()) {
             payload.windsurf_plan_status = account.windsurf_plan_status.clone();
         }
-        if payload.windsurf_user_status.is_none() {
+        if !status_has_plan_snapshot(payload.windsurf_user_status.as_ref()) {
             payload.windsurf_user_status = account.windsurf_user_status.clone();
         }
     }
@@ -917,7 +950,11 @@ pub fn upsert_account(payload: WindsurfOAuthCompletePayload) -> Result<WindsurfA
         last_used: now,
     });
 
+    let fresh_quota = has_quota_data(&payload);
     apply_payload(&mut account, payload);
+    if fresh_quota {
+        account.usage_updated_at = Some(now);
+    }
     account.id = account_id;
     account.created_at = created_at;
     account.quota_query_last_error = None;
@@ -1214,4 +1251,46 @@ pub fn read_local_login_hint() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod quota_snapshot_tests {
+    use super::*;
+    #[test]
+    fn empty_or_identity_only_snapshot_is_not_fresh_usage() {
+        for status in [
+            serde_json::json!({}),
+            serde_json::json!({"userStatus":{"planStatus":{}}}),
+            serde_json::json!({"planInfo":{"planName":"Free"}}),
+            serde_json::json!({"dailyQuotaRemainingPercent":"NaN"}),
+        ] {
+            assert!(!status_has_plan_snapshot(Some(&status)));
+        }
+    }
+    #[test]
+    fn explicit_zero_and_nested_quota_are_valid_snapshots() {
+        for status in [
+            serde_json::json!({"dailyQuotaRemainingPercent":0}),
+            serde_json::json!({"userStatus":{"planStatus":{"weekly_quota_remaining_percent":"75"}}}),
+            serde_json::json!({"windsurfPlanStatus":{"availablePromptCredits":2500}}),
+        ] {
+            assert!(status_has_plan_snapshot(Some(&status)));
+        }
+    }
+    #[test]
+    fn empty_refresh_keeps_previous_numeric_quota_cache() {
+        let account: WindsurfAccount = serde_json::from_value(serde_json::json!({
+            "id":"fixture", "github_login":"fixture", "github_id":1,
+            "github_access_token":"synthetic", "copilot_token":"synthetic",
+            "created_at":1, "last_used":1,
+            "windsurf_plan_status":{"dailyQuotaRemainingPercent":75}
+        }))
+        .unwrap();
+        let mut payload = WindsurfOAuthCompletePayload {
+            windsurf_plan_status: Some(serde_json::json!({})),
+            ..Default::default()
+        };
+        assert!(merge_refresh_payload_with_existing(&account, &mut payload));
+        assert_eq!(payload.windsurf_plan_status, account.windsurf_plan_status);
+    }
 }

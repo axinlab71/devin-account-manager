@@ -223,3 +223,25 @@ fn upstream_injection_encrypts_electron_session_and_rolls_back_on_failure() {
         .unwrap();
     assert_eq!(untouched, "preserved");
 }
+
+#[test]
+fn quota_update_timestamp_is_persisted_only_with_real_numeric_snapshot() {
+    let _lock = test_support::env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _data = IsolatedData::new();
+    let mut empty = payload("synthetic-quota-clock");
+    empty.windsurf_plan_status = Some(json!({}));
+    let account = windsurf_account::upsert_account(empty).unwrap();
+    assert_eq!(account.usage_updated_at, None);
+    let mut fresh = payload("synthetic-quota-clock");
+    fresh.windsurf_plan_status = Some(json!({"planStatus":{"dailyQuotaRemainingPercent":0}}));
+    let updated = windsurf_account::upsert_account(fresh).unwrap();
+    assert!(updated.usage_updated_at.is_some());
+    assert_eq!(
+        windsurf_account::load_account(&updated.id)
+            .unwrap()
+            .usage_updated_at,
+        updated.usage_updated_at
+    );
+}

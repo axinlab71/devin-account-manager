@@ -67,12 +67,21 @@ function App() {
  const [privateMode, setPrivateMode] = useState(() => readPreference('devin.privacy', 'false') === 'true');
  const [theme, setTheme] = useState(() => readPreference('devin.theme', 'dark'));
  const [activeId, setActiveId] = useState<string>();
+ const [initialLoading, setInitialLoading] = useState(true);
+ const [loadError, setLoadError] = useState('');
+ const [clientWarning, setClientWarning] = useState('');
+ const [bulkProgress, setBulkProgress] = useState<{done:number;total:number} | null>(null);
+ const bulkCancelled = useRef(false);
  useEffect(() => { document.documentElement.dataset.theme = theme; try { localStorage.setItem('devin.theme', theme); localStorage.setItem('devin.view', view); localStorage.setItem('devin.privacy', String(privateMode)); } catch {} }, [theme, view, privateMode]);
   const load = async () => {
-    const [list, status] = await Promise.all([service.listWindsurfAccounts(), invoke<ClientStatus>('get_client_status')]);
-    setAccounts(list); setClient(status);
+    const [list, status] = await Promise.allSettled([service.listWindsurfAccounts(), invoke<ClientStatus>('get_client_status')]);
+    if (list.status === 'fulfilled') { setAccounts(list.value); setLoadError(''); }
+    else { setLoadError('无法读取本地账号，请重试或检查数据目录权限。'); }
+    if (status.status === 'fulfilled') { setClient(status.value); setClientWarning(''); }
+    else { setClient(undefined); setClientWarning('客户端状态读取失败，暂时无法切换。可以继续管理账号，在设置中重新检测。'); }
+    if (list.status === 'rejected') throw new Error('无法读取本地账号数据，请检查目录权限后重试。');
   };
-  useEffect(() => { void load().catch(() => setError('无法读取本地数据。请在桌面应用中运行；若已在桌面运行，请检查数据目录权限。')); }, []);
+  useEffect(() => { void load().catch(() => {}).finally(() => setInitialLoading(false)); }, []);
   const run = async (fn: () => Promise<string | void>) => {
     if (operation.current) return;
     operation.current = true; setBusy(true); setError(''); setNotice('');
@@ -81,12 +90,14 @@ function App() {
     finally { operation.current = false; setBusy(false); }
   };
   const refresh = (account: WindsurfAccount) => run(async () => {
+    setActiveId(account.id);
     try {
       const updated = await service.refreshWindsurfToken(account.id);
       const failure = updated.quota_query_last_error;
       setHealth(h => ({ ...h, [account.id]: failure ? '刷新返回查询错误，请检查登录态' : '刷新完成' }));
       return failure ? '凭据刷新完成，但账号状态查询失败；请在客户端检查登录态。' : '账号刷新完成。';
     } catch (e) { setHealth(h => ({ ...h, [account.id]: '刷新失败，需要检查网络或重新登录' })); throw e; }
+    finally { setActiveId(undefined); }
   });
   const importInput = () => run(async () => {
     if (mode === 'token') await service.addWindsurfAccountWithToken(input.trim());
@@ -132,15 +143,25 @@ function App() {
     return current || (sort === 'name' ? identity(a).localeCompare(identity(b), 'zh-CN') : sort === 'created' ? b.created_at - a.created_at : b.last_used - a.last_used);
   });
   const currentAccount = accounts.find(a => a.id === client?.currentAccountId);
+  const deletingAccount = accounts.find(a => a.id === deleting);
   const refreshAll = () => run(async () => {
     let success = 0, failed = 0;
-    for (const a of accounts) {
-      setActiveId(a.id);
-      try { const updated = await service.refreshWindsurfToken(a.id); if (updated.quota_query_last_error) { failed++; setHealth(h => ({ ...h, [a.id]: '刷新返回查询错误，请检查登录态' })); } else { success++; setHealth(h => ({ ...h, [a.id]: '刷新完成' })); } }
-      catch { failed++; setHealth(h => ({ ...h, [a.id]: '刷新失败，请检查网络或重新登录' })); }
-    }
-    setActiveId(undefined);
-    return `刷新结束：${success} 个完成${failed ? `，${failed} 个需检查，可在对应账号上单独重试` : ''}。`;
+    bulkCancelled.current = false;
+    setBulkProgress({done:0,total:accounts.length});
+    try {
+      for (const a of accounts) {
+        if (bulkCancelled.current) break;
+        setActiveId(a.id);
+        try {
+          const updated = await service.refreshWindsurfToken(a.id);
+          setAccounts(previous => previous.map(item => item.id === updated.id ? updated : item));
+          if (updated.quota_query_last_error) { failed++; setHealth(h => ({...h,[a.id]:'额度查询失败'})); }
+          else { success++; setHealth(h => ({...h,[a.id]:'已同步'})); }
+        } catch { failed++; setHealth(h => ({...h,[a.id]:'刷新失败'})); }
+        setBulkProgress({done:success+failed,total:accounts.length});
+      }
+      return `${bulkCancelled.current ? '已停止后续刷新' : '刷新结束'}：${success} 个完成${failed ? `，${failed} 个需检查，可在对应账号上单独重试` : ''}。`;
+    } finally { setActiveId(undefined); setBulkProgress(null); }
   });
   const switchAccount = (a: WindsurfAccount) => run(async () => {
     setActiveId(a.id);
@@ -150,16 +171,17 @@ function App() {
   return <div className="app-shell">
     <aside className="sidebar"><div className="brand"><img className="mark" src="/devin.png" alt=""/><div><strong>Devin 账户管理器</strong><span className="brand-caption">ACCOUNT MANAGER</span></div></div>
       <div className="nav-label">工作空间</div><button className={`nav-item ${!settings ? 'active' : ''}`} onClick={() => setSettings(false)}><Icon name="grid"/>账号管理<span className="nav-count">{accounts.length}</span></button><button className={`nav-item ${settings ? 'active' : ''}`} disabled={busy} onClick={() => { setPath(client?.appPath || ''); setSettings(true); }}><Icon name="settings"/>客户端设置</button>
-      <div className="sidebar-bottom"><div className="local-note"><Icon name="shield"/><div><strong>凭据本机加密保存</strong><p>仅使用本机账号数据</p></div></div><div className="sidebar-meta"><span>v0.2.0</span><button className="icon-button" aria-label={theme === 'dark' ? '切换浅色主题' : '切换深色主题'} title="切换主题" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}><Icon name={theme === 'dark' ? 'sun' : 'moon'}/></button></div></div>
+      <div className="sidebar-bottom"><div className="local-note"><Icon name="shield"/><div><strong>凭据本机加密保存</strong><p>仅使用本机账号数据</p></div></div><div className="sidebar-meta"><span>v0.2.1</span><button className="icon-button" aria-label={theme === 'dark' ? '切换浅色主题' : '切换深色主题'} title="切换主题" onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}><Icon name={theme === 'dark' ? 'sun' : 'moon'}/></button></div></div>
     </aside>
     <main><header className="page-heading"><div><span className="eyebrow">工作空间 / DEVIN</span><h1>账户管理器</h1><p>查看使用额度，管理和切换 Devin 账户。</p></div><div className="row"><button className={`icon-button ${privateMode ? 'selected' : ''}`} aria-label={privateMode ? '显示账号信息' : '隐藏账号信息'} aria-pressed={privateMode} title="隐私显示" onClick={() => { if (!privateMode) setQuery(''); setPrivateMode(!privateMode); }}><Icon name="eye"/></button><button className="primary" disabled={busy} onClick={addAccount}><Icon name="plus"/>添加账号</button></div></header>
-    <div className="toast-stack" aria-live="polite">{busy && !browserWaiting && <div className="toast" role="status"><Icon name="refresh" spinning/>正在处理，请稍候…</div>}{notice && !browserWaiting && !busy && <div className="toast success" role="status"><Icon name="check"/><span>{notice}</span><button className="icon-button" aria-label="关闭提示" onClick={() => setNotice('')}><Icon name="close"/></button></div>}{error && !adding && !settings && <div className="toast error" role="alert"><span>{error}</span><button className="icon-button" aria-label="关闭错误提示" onClick={() => setError('')}><Icon name="close"/></button></div>}</div>
+    <div className="toast-stack" aria-live="polite">{busy && !browserWaiting && <div className="toast" role="status"><Icon name="refresh" spinning/>{bulkProgress ? `正在刷新 ${bulkProgress.done} / ${bulkProgress.total}` : '正在处理，请稍候…'}{bulkProgress && <button disabled={bulkCancelled.current} onClick={() => { bulkCancelled.current = true; setBulkProgress(p => p ? {...p} : p); }}>停止后续刷新</button>}</div>}{notice && !browserWaiting && !busy && <div className="toast success" role="status"><Icon name="check"/><span>{notice}</span><button className="icon-button" aria-label="关闭提示" onClick={() => setNotice('')}><Icon name="close"/></button></div>}{error && !adding && !settings && <div className="toast error" role="alert"><span>{error}</span><button className="icon-button" aria-label="关闭错误提示" onClick={() => setError('')}><Icon name="close"/></button></div>}</div>
+    {clientWarning && <div className="client-warning" role="status">{clientWarning}<button disabled={busy} onClick={() => { setPath(''); setSettings(true); }}>客户端设置</button></div>}
     <section className="account-section"><div className="section-heading"><div><h2>全部账户 <span>{visible.length}{visible.length !== accounts.length ? ` / ${accounts.length}` : ''}</span></h2><p>当前账号置顶 · 切换时会自动重启客户端，请先保存工作</p></div><button disabled={busy || accounts.length === 0} onClick={() => void refreshAll()}><Icon name="refresh" spinning={busy && !!activeId}/>刷新全部</button></div>
       <div className="toolbar"><div className="search-field"><Icon name="search"/><input aria-label="搜索账号" value={query} onChange={e => setQuery(e.target.value)} placeholder="搜索名称、邮箱或标签…"/>{query && <button className="icon-button" aria-label="清空搜索" onClick={() => setQuery('')}><Icon name="close"/></button>}</div><select aria-label="筛选账号" value={filter} onChange={e => setFilter(e.target.value)}><option value="all">全部账号</option><option value="current">当前账号</option><option value="attention">需要检查</option></select><select aria-label="账号排序" value={sort} onChange={e => setSort(e.target.value)}><option value="recent">最近使用</option><option value="created">最近添加</option><option value="name">名称排序</option></select><div className="view-toggle" aria-label="显示方式"><button className={view === 'grid' ? 'selected icon-button' : 'icon-button'} aria-label="网格视图" aria-pressed={view === 'grid'} onClick={() => setView('grid')}><Icon name="grid"/></button><button className={view === 'list' ? 'selected icon-button' : 'icon-button'} aria-label="列表视图" aria-pressed={view === 'list'} onClick={() => setView('list')}><Icon name="list"/></button></div></div>
-      {accounts.length === 0 ? <section className="empty"><span className="empty-icon"><Icon name="plus"/></span><h3>从第一个账号开始</h3><p>在浏览器完成授权，账号将自动保存到这里。<br/>也可以导入已有的 Token 或 JSON。</p><button className="primary" disabled={busy} onClick={addAccount}><Icon name="globe"/>网页授权添加</button><small>支持多账号 · 本地加密存储</small></section> : visible.length === 0 ? <section className="empty compact"><Icon name="search"/><h3>没有找到匹配的账号</h3><p>试试其他关键词，或清除筛选条件。</p><button onClick={() => { setQuery(''); setFilter('all'); }}>清除筛选</button></section> : <section className={`accounts ${view}`} aria-label="账号列表">{visible.map(a => {
+      {initialLoading ? <section className="empty" role="status"><Icon name="refresh" spinning/><h3>正在读取本地账号</h3></section> : loadError && accounts.length === 0 ? <section className="empty" role="alert"><h3>账号读取失败</h3><p>{loadError}</p><button disabled={busy} onClick={() => void run(async () => { await load(); })}>重新读取</button></section> : accounts.length === 0 ? <section className="empty"><span className="empty-icon"><Icon name="plus"/></span><h3>从第一个账号开始</h3><p>在浏览器完成授权，账号将自动保存到这里。<br/>也可以导入已有的 Token 或 JSON。</p><button className="primary" disabled={busy} onClick={addAccount}><Icon name="globe"/>网页授权添加</button><small>支持多账号 · 本地加密存储</small></section> : visible.length === 0 ? <section className="empty compact"><Icon name="search"/><h3>没有找到匹配的账号</h3><p>试试其他关键词，或清除筛选条件。</p><button onClick={() => { setQuery(''); setFilter('all'); }}>清除筛选</button></section> : <section className={`accounts ${view}`} aria-label="账号列表">{visible.map(a => {
        const current = client?.currentAccountId === a.id;
        const attention = needsAttention(a);
-       return <article key={a.id} className={`account ${current ? 'current' : ''}`}><div className="card-identity"><div className="avatar">{privateMode ? 'D' : identity(a).slice(0, 1).toUpperCase()}</div><div className="account-info"><div className="name" title={identity(a)}>{identity(a)}</div><p title={email(a)}>{email(a)}</p></div>{current && <span className="badge"><span className="dot online"/>当前</span>}</div><div className="card-meta"><span className="plan-badge">{accountPlan(a)}</span><span className={`health ${attention ? 'warning' : ''}`}><span className="dot"/>{health[a.id] || (attention ? '需检查' : '正常') }</span></div>{a.tags && a.tags.length > 0 && <div className="tags">{a.tags.map(t => <span key={t}>{privateMode ? '标签' : t}</span>)}</div>}<AccountQuota account={a}/><div className="last-used">最近使用 <span>{formatTime(a.last_used)}</span></div><div className="card-actions"><button className="icon-button" aria-label={`刷新 ${identity(a)}`} title="刷新登录态" disabled={busy} onClick={() => void refresh(a)}><Icon name="refresh"/></button><button className="icon-button danger" aria-label={`删除 ${identity(a)}`} title="删除账号" disabled={busy} onClick={() => setDeleting(a.id)}><Icon name="trash"/></button><button className={current ? 'switch-button' : 'primary switch-button'} disabled={busy || !client?.installed} title={client?.installed ? '保存工作后切换，客户端会自动重启' : '请先配置客户端路径'} onClick={() => void switchAccount(a)}><Icon name="arrow" spinning={busy && activeId === a.id}/>{busy && activeId === a.id ? '处理中' : current ? '重新应用' : '切换账号'}</button></div></article>;
+       return <article key={a.id} className={`account ${current ? 'current' : ''}`}><div className="card-identity"><div className="avatar">{privateMode ? 'D' : identity(a).slice(0, 1).toUpperCase()}</div><div className="account-info"><div className="name" title={identity(a)}>{identity(a)}</div><p title={email(a)}>{email(a)}</p></div>{current && <span className="badge"><span className="dot online"/>当前</span>}</div><div className="card-meta"><span className="plan-badge">{accountPlan(a)}</span><span className={`health ${attention ? 'warning' : ''}`}><span className="dot"/>{health[a.id] || (attention ? '需检查' : a.usage_updated_at ? '已同步' : '尚未在线检查') }</span></div>{a.tags && a.tags.length > 0 && <div className="tags">{a.tags.map(t => <span key={t}>{privateMode ? '标签' : t}</span>)}</div>}<AccountQuota account={a} refreshFailed={Boolean(health[a.id]?.includes('失败') || health[a.id]?.includes('错误'))}/><div className="last-used">最近使用 <span>{formatTime(a.last_used)}</span></div><div className="card-actions"><button className="icon-button" aria-label={`刷新 ${identity(a)}`} title="刷新登录态" disabled={busy} onClick={() => void refresh(a)}><Icon name="refresh" spinning={busy && activeId === a.id}/></button><button className="icon-button danger" aria-label={`删除 ${identity(a)}`} title="删除账号" disabled={busy} onClick={() => setDeleting(a.id)}><Icon name="trash"/></button><button className={current ? 'switch-button' : 'primary switch-button'} disabled={busy || !client?.installed} title={client?.installed ? '保存工作后切换，客户端会自动重启' : '请先配置客户端路径'} onClick={() => void switchAccount(a)}><Icon name="arrow" spinning={busy && activeId === a.id}/>{busy && activeId === a.id ? '处理中' : current ? '重新应用' : '切换账号'}</button></div></article>;
       })}</section>}
     </section><footer><span><Icon name="shield"/>凭据在本机加密保存</span><span>源自 <a href="https://github.com/jlcodes99/cockpit-tools" target="_blank" rel="noreferrer">Cockpit Tools · jlcodes</a> · CC BY-NC-SA 4.0</span></footer>
     </main>
@@ -169,7 +191,7 @@ function App() {
 收到授权后，我们会验证凭据并自动保存账号。` : `使用系统浏览器登录 Devin，授权完成后将自动安全保存。
 无需先打开 Devin Desktop。`}</p></div><div className="steps"><span><b>1</b>打开浏览器</span><i/><span><b>2</b>完成登录</span><i/><span><b>3</b>自动保存</span></div><button className="primary full-width" disabled={busy} onClick={() => void startBrowser()}><Icon name="globe"/>{browserWaiting ? '正在等待授权…' : '开始网页授权'}</button>{browserWaiting && <button className="full-width cancel-auth" onClick={() => void cancelBrowser()}>取消本次授权</button>}<div className="local-import"><span>已经在官方客户端登录？</span><button className="text-button" disabled={busy} onClick={() => void run(async () => { await service.importWindsurfFromLocal(); setAdding(false); return '已导入官方客户端当前账号。'; })}>导入本机账号 →</button></div></> : <><label htmlFor="credentials">{mode === 'token' ? '登录凭据' : '账号 JSON'}</label><p className="hint">{mode === 'token' ? '使用你持有的有效凭据，导入后将自动验证并保存。' : '兼容 Cockpit Tools 导出的单个账号对象或账号数组。'}</p><textarea id="credentials" spellCheck={false} autoComplete="off" value={input} onChange={e => setInput(e.target.value)} placeholder={mode === 'token' ? 'auth1_… / devin-session-token$… / sk-ws-…' : '{ … }'}/><label className="file-picker">从文件读取<input type="file" accept={mode === 'json' ? '.json,application/json' : '.txt,text/plain'} disabled={busy} aria-label="读取导入文件" onChange={e => { const f = e.target.files?.[0]; if (f) void f.text().then(setInput).catch(() => setError('无法读取文件')); }}/></label><button className="primary full-width" disabled={busy || !input.trim()} onClick={() => void importInput()}>{busy ? '正在导入…' : '导入并保存'}</button></>}
       </div><p className="privacy-note"><Icon name="shield"/>凭据仅保存在本机，请勿将账号文件发给他人。</p>{error && <p className="error notice" role="alert">{error}</p>}</Modal>}
-    {deleting && <Modal title="删除这个账号？" small onClose={() => setDeleting(undefined)} locked={busy}><p>将从本机账号列表中移除 <strong>{identity(accounts.find(a => a.id === deleting)!)}</strong>，客户端当前登录态不会被注销。</p><div className="modal-footer"><button disabled={busy} onClick={() => setDeleting(undefined)}>保留账号</button><button className="danger danger-solid" disabled={busy} onClick={() => void run(async () => { await service.deleteWindsurfAccount(deleting); setDeleting(undefined); return '已删除保存的账号。'; })}>确认删除</button></div>{error && <p className="error notice" role="alert">{error}</p>}</Modal>}
+    {deleting && <Modal title="删除这个账号？" small onClose={() => setDeleting(undefined)} locked={busy}><p>将从本机账号列表中移除 <strong>{deletingAccount ? identity(deletingAccount) : '该账号'}</strong>，客户端当前登录态不会被注销。</p><div className="modal-footer"><button disabled={busy} onClick={() => setDeleting(undefined)}>保留账号</button><button className="danger danger-solid" disabled={busy} onClick={() => void run(async () => { await service.deleteWindsurfAccount(deleting); setDeleting(undefined); return '已删除保存的账号。'; })}>确认删除</button></div>{error && <p className="error notice" role="alert">{error}</p>}</Modal>}
   </div>;
 }
 createRoot(document.getElementById('root')!).render(<StrictMode><App /></StrictMode>);
