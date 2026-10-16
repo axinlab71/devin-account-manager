@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 struct Pending {
     login_id: String,
     baseline: Option<String>,
-    created: Instant,
+    deadline: Instant,
 }
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 const TIMEOUT: Duration = Duration::from_secs(600);
@@ -100,7 +100,7 @@ pub fn start() -> Result<StartResponse, String> {
     let mut guard = PENDING.lock().map_err(|_| "登录会话锁不可用")?;
     if guard
         .as_ref()
-        .is_some_and(|p| p.created.elapsed() < TIMEOUT)
+        .is_some_and(|p| Instant::now() < p.deadline)
     {
         return Err("已有网页授权正在进行，请完成或取消后重试".into());
     }
@@ -116,7 +116,7 @@ pub fn start() -> Result<StartResponse, String> {
     *guard = Some(Pending {
         login_id: login_id.clone(),
         baseline,
-        created: Instant::now(),
+        deadline: Instant::now() + TIMEOUT,
     });
     if open::that_detached(url).is_err() {
         *guard = None;
@@ -143,7 +143,7 @@ pub async fn poll(login_id: &str) -> Result<Option<WindsurfAccount>, String> {
             .as_ref()
             .filter(|p| p.login_id == login_id)
             .ok_or("登录已取消或不存在")?;
-        if pending.created.elapsed() >= TIMEOUT {
+        if Instant::now() >= pending.deadline {
             *guard = None;
             return Err("网页授权超时，请重新开始".into());
         }
@@ -168,7 +168,7 @@ pub async fn poll(login_id: &str) -> Result<Option<WindsurfAccount>, String> {
     let mut guard = PENDING.lock().map_err(|_| "登录会话锁不可用")?;
     if !guard
         .as_ref()
-        .is_some_and(|p| p.login_id == login_id && p.created.elapsed() < TIMEOUT)
+        .is_some_and(|p| p.login_id == login_id && Instant::now() < p.deadline)
     {
         return Err("登录已取消或超时，未保存账号".into());
     }
@@ -218,7 +218,7 @@ mod tests {
         *PENDING.lock().unwrap() = Some(Pending {
             login_id: "fixture".into(),
             baseline: None,
-            created: Instant::now(),
+            deadline: Instant::now() + TIMEOUT,
         });
         cancel("unrelated").unwrap();
         assert!(PENDING.lock().unwrap().is_some());
@@ -227,7 +227,7 @@ mod tests {
         *PENDING.lock().unwrap() = Some(Pending {
             login_id: "expired".into(),
             baseline: None,
-            created: Instant::now() - TIMEOUT - Duration::from_secs(1),
+            deadline: Instant::now(),
         });
         assert!(poll("expired").await.unwrap_err().contains("超时"));
         assert!(PENDING.lock().unwrap().is_none());
