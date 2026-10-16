@@ -4,7 +4,7 @@
 
 **Windows 桌面账号管理工具 · 非官方项目**
 
-[下载最新版本](https://github.com/sxxxxxxxxxxxxxxxxxxxxx/devin-account-manager/releases/latest) · [上游 Cockpit Tools](https://github.com/jlcodes99/cockpit-tools) · [许可与署名](NOTICE.md)
+[下载最新版本](https://github.com/axinlab71/devin-account-manager/releases/latest) · [上游 Cockpit Tools](https://github.com/jlcodes99/cockpit-tools) · [许可与署名](NOTICE.md)
 
 ![账号列表（合成演示数据）](docs/ui-0.3.1-light.png)
 

@@ -51,7 +51,7 @@ const path = require('node:path');
  await page.getByRole('textbox',{name:'客户端程序完整路径'}).fill('E:\\Devin\\Devin.exe');await page.getByRole('button',{name:'保存路径',exact:true}).click();await page.getByText('客户端路径已保存。',{exact:true}).waitFor();await page.getByRole('button',{name:'关闭提示',exact:true}).click();await page.screenshot({path:'docs/ui-0.3.1-settings-client.png',fullPage:true});
  await page.getByRole('tab',{name:'数据管理',exact:true}).click();await page.getByText('Synthetic UI fixture',{exact:true}).waitFor();await page.screenshot({path:'docs/ui-0.3.1-settings-data.png',fullPage:true});
  await page.getByRole('button',{name:'导入账号',exact:true}).click();await page.getByRole('tab',{name:'本地迁移',exact:true}).waitFor();await page.keyboard.press('Escape');
- await page.getByRole('tab',{name:'关于',exact:true}).click();await page.getByText('v0.3.1',{exact:true}).waitFor();await page.screenshot({path:'docs/ui-0.3.1-about.png',fullPage:true});
+ await page.getByRole('tab',{name:'关于',exact:true}).click();await page.getByText('v0.3.1',{exact:true}).waitFor();assert.equal(await page.getByRole('link',{name:/开源仓库/}).getAttribute('href'),'https://github.com/axinlab71/devin-account-manager');await page.screenshot({path:'docs/ui-0.3.1-about.png',fullPage:true});
  await page.getByRole('tab',{name:'关于',exact:true}).press('Home');assert.equal(await page.getByRole('tab',{name:'通用',exact:true}).getAttribute('aria-selected'),'true');
  await page.locator('.sidebar .nav-item').first().click();
  await page.locator('h1').click();
