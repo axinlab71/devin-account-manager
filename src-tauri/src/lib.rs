@@ -20,6 +20,12 @@ fn delete_windsurf_account(account_id: String) -> Result<(), String> {
     accounts::remove_account(&account_id)
 }
 #[tauri::command]
+fn import_cockpit_accounts(
+    source_path: Option<String>,
+) -> Result<modules::cockpit_migration::MigrationReport, String> {
+    modules::cockpit_migration::import(source_path)
+}
+#[tauri::command]
 fn import_windsurf_from_json(json_content: String) -> Result<Vec<WindsurfAccount>, String> {
     accounts::import_from_json(&json_content)
 }
@@ -221,6 +227,7 @@ pub fn run() {
             list_windsurf_accounts,
             delete_windsurf_account,
             import_windsurf_from_json,
+            import_cockpit_accounts,
             add_windsurf_account_with_token,
             import_windsurf_from_local,
             refresh_windsurf_token,

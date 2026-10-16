@@ -3,6 +3,7 @@ pub mod account_index_repair;
 pub mod atomic_write;
 pub mod auth_transport;
 pub mod client_version;
+pub mod cockpit_migration;
 pub mod config;
 pub mod deferred_account_rewrite;
 pub mod key_protection;

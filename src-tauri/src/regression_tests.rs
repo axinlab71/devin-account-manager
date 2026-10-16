@@ -245,3 +245,59 @@ fn quota_update_timestamp_is_persisted_only_with_real_numeric_snapshot() {
         updated.usage_updated_at
     );
 }
+
+#[test]
+fn cockpit_migration_reads_source_without_overwrite_and_reports_partial_failures() {
+    let _lock = test_support::env_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let data = IsolatedData::new();
+    let source = data.0.join("source");
+    let folder = source.join("windsurf_accounts");
+    std::fs::create_dir_all(&folder).unwrap();
+    let saved = windsurf_account::upsert_account(payload("synthetic-migration-only")).unwrap();
+    let content = secure_account_storage::serialize_account_file("windsurf", &saved).unwrap();
+    std::fs::write(folder.join("fixture.json"), &content).unwrap();
+    std::fs::copy(
+        data.0.join("secure-account-storage.key"),
+        source.join("secure-account-storage.key"),
+    )
+    .unwrap();
+    let original_key = std::fs::read(source.join("secure-account-storage.key")).unwrap();
+    windsurf_account::remove_account(&saved.id).unwrap();
+    std::fs::write(folder.join("broken.json"), "invalid synthetic JSON").unwrap();
+    let first = cockpit_migration::import(Some(source.to_string_lossy().into())).unwrap();
+    assert_eq!((first.imported, first.skipped, first.failed), (1, 0, 1));
+    assert_eq!(
+        windsurf_account::load_account(&saved.id)
+            .unwrap()
+            .copilot_token,
+        saved.copilot_token
+    );
+    let second = cockpit_migration::import(Some(source.to_string_lossy().into())).unwrap();
+    assert_eq!((second.imported, second.skipped, second.failed), (0, 1, 1));
+    assert_eq!(
+        std::fs::read_to_string(folder.join("fixture.json")).unwrap(),
+        content
+    );
+    assert_eq!(
+        std::fs::read(source.join("secure-account-storage.key")).unwrap(),
+        original_key
+    );
+    windsurf_account::remove_account(&saved.id).unwrap();
+    std::fs::remove_file(source.join("secure-account-storage.key")).unwrap();
+    let missing_key = cockpit_migration::import(Some(source.to_string_lossy().into())).unwrap();
+    assert_eq!((missing_key.imported, missing_key.failed), (0, 2));
+    assert!(!source.join("secure-account-storage.key").exists());
+    std::fs::write(
+        folder.join("fixture.json"),
+        serde_json::to_string(&saved).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cockpit_migration::import(Some(source.to_string_lossy().into()))
+            .unwrap()
+            .imported,
+        1
+    );
+}

@@ -6,11 +6,11 @@
 
 [下载最新版本](https://github.com/sxxxxxxxxxxxxxxxxxxxxx/devin-account-manager/releases/latest) · [上游 Cockpit Tools](https://github.com/jlcodes99/cockpit-tools) · [许可与署名](NOTICE.md)
 
-![账号列表（合成演示数据）](docs/ui-0.2.1-dark-list.png)
+![账号列表（合成演示数据）](docs/ui-0.3.0-light.png)
 
 从 [Cockpit Tools](https://github.com/jlcodes99/cockpit-tools) 提取的精简 Devin Desktop 账号管理应用。核心账号、导入、刷新和客户端会话注入代码来自原项目，并非重新实现一套协议。
 
-## 使用（0.2.1）
+## 使用（0.3.0）
 
 1. 打开 Devin Account Manager，点击“添加账号 → 网页授权 → 开始网页授权”。
 2. 在系统浏览器完成目标账号登录。
@@ -29,6 +29,14 @@
 没有注册或接管 `devin://`，没有修改服务端允许列表，也没有伪造新的 client_id。授权凭据不写入 pending 文件、不出现在日志中；保存的账号详情仍使用原有加密格式。
 
 **验证范围：**本地回调、额度解析、加密保存和模拟客户端注入有自动化回归测试覆盖。离线测试与程序成功启动不能代替真实账号的完整登录、在线刷新和两账号切换验证；具体范围见 [docs/VALIDATION.md](docs/VALIDATION.md)。
+
+## 0.3.0 紧凑布局与迁移
+
+- 卡片缩小，套餐采用彩色标签；日/周额度仍直接可见，重置时间可展开，最近使用时间可在卡片提示中查看。
+- Token 与 JSON 合并为自动识别入口，支持读取 .txt / .json 文件（最大 5 MB）。
+- 添加账号 → 本地迁移 → 导入 Cockpit 账号：自动查找 ~/.cockpit_tools 或旧版 ~/.antigravity_cockpit，也可填写数据目录。只迁移 Windsurf / Devin，不修改原文件或密钥；重复账号跳过，失败数量单独报告。
+- Cockpit 加密文件需要原目录 secure-account-storage.key；受 Windows 保护的密钥只能由原 Windows 用户读取。也可使用 Cockpit 导出的 JSON。
+- 主题、版本、存储说明及许可署名集中在应用设置。
 
 ## 0.2.1 可靠性完善
 
