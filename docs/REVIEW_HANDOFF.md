@@ -300,3 +300,290 @@ The persisted-file model changed from "promote the restored record" to a
 5. **Tests**: `recovery_gate` module — restored pending/failed promotion,
    double-load persistence, confirm block, unknown-resolution fail-close
    (113 tests total).
+
+## 17. Manual experimental native-switch entry + settings UX
+
+The experimental native path was previously only reachable via
+low-quota scan → recommendation → confirm. This pass adds a direct
+manual entry so the path can be exercised for real acceptance.
+
+1. **Account-card entry**: non-current cards show a secondary
+   「免重启」 button next to the standard 「切换账号」 (restart) action.
+   It opens an explicit experimental-confirmation dialog — states that
+   the official Devin client may show its own confirmation modal, that
+   URI launch is NOT proof of a successful switch, and that the user
+   should verify + send one AI request afterwards. The standard
+   restart path is unchanged.
+2. **`try_native_switch` IPC** (`src-tauri/src/lib.rs`): holds
+   `CLIENT_LOCK` + the inter-process client-operation lock, then
+   `begin_manual_switch` persists a `manual-*` in-flight record BEFORE
+   the URI launch (recovery gate, concurrent in-flight block, crash
+   normalization, `.bak` promotion, `set_config` protection all reuse
+   the same machinery). Success → durable `awaiting_client`; adapter
+   failure → record dropped (the URI never left; a `failed` manual
+   record would surface a banner retry that `validate` would always
+   reject for non-pool targets). The banner shows manual-specific copy
+   (`manual_switch` reason) with verify/dismiss, so closing the modal
+   never strands the operation. No credentials cross IPC; no client
+   files are written.
+3. **Settings separation**: 「监控模式」(when/who confirms) and
+   「切换方式」(restart vs experimental no-restart) are now separate
+   rows; `auto` stays disabled.
+4. **Backup pool redesign**: full-width aligned rows
+   (checkbox/name/plan/quota/priority) with 全选/清空 and a live
+   `已选 N 个` count — replaces the cramped left-desc/right-list row.
+5. **Status clarity**: a 监控状态 row shows 运行中/已暂停/已关闭,
+   saved pool count, last scan time (`lastScanAtMs` on the DTO), and a
+   human-readable reason when no recommendation was produced.
+   「立即扫描」 is labelled （使用已保存设置） while the form is dirty.
+6. **Save feedback**: the full-width banner is replaced by a concise
+   self-clearing `已保存，备用账号 N 个` hint.
+7. **Smoke coverage**: card entry visibility (absent on the current
+   card), experimental copy, launch→verify flow, pool select-all/clear
+   count, dirty-scan hint, and save feedback are asserted in
+   `scripts/ui-smoke.cjs`.
+
+8. **Self-review fix — manual launches now persist an in-flight
+   record**: the first version of the card entry launched the URI with
+   no durable record, so a second click (or a banner confirm) could
+   launch overlapping official logins and a crash left nothing to
+   reconcile. `begin_manual_switch`/`finish_manual_switch` close that.
+   Regression tests: persist/concurrent-block, failure-drop,
+   recovery-gate block (3 new tests).
+9. **Build environment fix**: `cargo test` test binaries crashed with
+   `STATUS_ENTRYPOINT_NOT_FOUND` — tao's `common-controls-v6` feature
+   statically imports `TaskDialogIndirect` (only in the WinSxS v6
+   comctl32), and unit-test binaries never receive the manifest that
+   `tauri-build` embeds into the app binary. `build.rs` now disables
+   the winres-embedded manifest (`new_without_app_manifest`) and feeds
+   `src-tauri/common-controls.manifest` — byte-identical to tauri-build's
+   default `windows-app-manifest.xml` — to the linker via
+   `cargo::rustc-link-arg=/MANIFEST:EMBED + /MANIFESTINPUT`. The arg
+   applies to every binary target including lib unit tests and the app
+   exe; the exe's embedded manifest was verified to contain exactly the
+   Common-Controls v6 dependency plus linker-generated `asInvoker`
+   trustInfo, i.e. equivalent to the previous winres output.
+
+Verification: 116 cargo tests, `npm run build`, `test:quota`,
+`ui-smoke.cjs`, `diff --check` — all green. Still **not** validated
+against a real Devin Desktop client; URI launch ≠ confirmed switch.
+
+## 18. Switch-method setting (product design change)
+
+Requirement: standard restart stays the default; native hot-switch is an
+explicit, labeled opt-in with per-account eligibility.
+
+1. **Backend eligibility flag** — `AccountView.native_switch_credential_ready`:
+   `native_switch::has_uri_compatible_credential` replicates the
+   `resolve_login_token` credential-existence check (devin-session
+   fields or stored `ott$`/`oidc$`) without minting or network access.
+   Credentials still never cross IPC — only the boolean. Semantics
+   deliberately narrow: "credential precondition met", NOT "the client
+   will accept the switch" — that still requires real validation.
+2. **Setting** — `devin.switchMethod` localStorage pref, `standard`
+   (default) / `native`. Exposed as 「切号方式」 select under
+   应用设置 → 客户端 → 切换保护.
+3. **Card actions follow the method** — `standard`: primary 「切换账号」
+   (restart) + secondary 「免重启」; `native`: primary 「免重启切换」 +
+   secondary 「标准切号」. Section heading states the active method.
+   The standard restart path (`inject_windsurf_to_vscode`) is
+   untouched and always reachable.
+4. **Eligibility labeling** — `native_switch_credential_ready === false`
+   shows a 「暂不支持免重启」 badge on the card meta (reason in title)
+   and disables the native action; the standard button stays enabled.
+   No error dialog after click.
+5. **Safety unchanged** — `try_native_switch` still persists the
+   durable in-flight record BEFORE launching, gates on
+   recovery/in-flight state, launches the official URI only, and never
+   degrades to a forced restart. `全自动（未开放）` stays disabled.
+6. **Credential-ready accounts** — eligibility is "has a Devin session
+   credential we can attempt the official mint with": any
+   `devin-session-token$` value (dedicated field or the generic
+   `windsurf_auth_token` / `windsurf_api_key` / `github_access_token`
+   slots used by session-token import, browser OAuth and local-client
+   import), or a stored `ott$`/`oidc$`. At launch,
+   `get_one_time_auth_token` sends `x-devin-auth1-token`,
+   `x-devin-account-id` and `x-devin-primary-org-id` only when present
+   — session-only accounts attempt with just the session credential;
+   if the endpoint requires the full header set it fails honestly as
+   `ott_mint_failed` rather than fabricating context. Password login
+   (`添加账号 → 邮箱密码` → `add_windsurf_account_with_password`) and
+   `auth1_` token paste still produce the complete four-field set for
+   the strongest mint.
+
+Smoke coverage added: unsupported badge + disabled native button +
+enabled standard button; method select default/persistence; primary/
+secondary button swap under `native`; 邮箱密码 tab →
+`add_windsurf_account_with_password` call + modal close. Verification:
+116 cargo tests, `npm run build`, `test:quota`, `ui-smoke.cjs`,
+`diff --check` — green.
+
+## 2026-10-17 �� Real-client URI delivery diagnosis + rotation dispatch fix
+
+Live-client evidence (Windows, Devin Desktop @ E:\Devin, ext codeium.windsurf 0.2.0):
+
+- `devin://codeium.windsurf#access_token=<t>` DOES reach the extension
+  natively: renderer.log shows `maybeHandleUriWithToken �� handleAuthToken
+  �� handleCodeiumAuthToken �� registerUser`. Fake tokens fail server-side
+  with `invalid auth token`. No confirmation modal was observed �� this
+  build calls registerUser directly (the modal likely only appears in
+  specific state/account conditions).
+- Root cause of earlier "nothing happens": `ELECTRON_RUN_AS_NODE=1` in the
+  launching process env (inherited from Devin/VS Code integrated terminals)
+  makes the spawned Devin.exe boot in Node mode and die with
+  `bad option: --open-url` before forwarding. Fixed: `launch_uri` and the
+  standard restart spawn (`sanitize_windows_gui_launch_env`) now strip
+  `ELECTRON_RUN_AS_NODE` / `VSCODE_DEV` from the child environment.
+- `launch_uri` no longer fire-and-forget: waits for the launcher exit code,
+  then polls `%APPDATA%\devin\logs` up to 6s for a new session dir �� a second
+  Devin.exe instance creates one before forwarding the URI. Absence reports
+  `uri_delivery_unconfirmed` instead of entering "await official confirm".
+
+Rotation confirm now honors the switch-method setting: `confirm_rotation`
+takes `switchMethod`; `native` �� native URI adapter, default/standard ��
+`inject_windsurf_to_vscode_inner` (extracted so the lock held by
+`confirm_rotation` is not re-acquired). A successful standard outcome is
+locally verified �� `mark_verified` records cooldown/last-switch; native
+stays `awaiting_client` until `verify_native_login` observes the session.
+Banner copy states which method will run; smoke covers both dispatches.
+
+Still open / honestly unresolved: no proof a real `ott$` completes login
+(needs user's real account click); verify reads local session only �� no
+remote ACP/AI-request identity proof; `failed to fetch team settings`
+root cause undetermined (network vs auth context).
+
+Follow-up same day: after a real `devin://` login succeeded once, the
+manager failed to identify the new current account �� `current_id` only
+matched on token equality, and the client stores a brand-new session token
+after URI login. `account_identity::current_id` now matches in order:
+(1) session `_switcherDesktopAccountId` == account devin id (unique),
+(2) stored token equality, (3) unique official session label. Ambiguous
+matches still return no current account rather than guessing.
+
+## 2026-10-17b — Unconfirmed-delivery lifecycle fix
+
+Reviewer finding: when `launch_uri` cannot confirm delivery
+(`uri_delivery_unconfirmed`), the URI may still be processed by the
+client — but the old code dropped/marked the in-flight record `failed`,
+which permitted an immediate second click and overlapping login requests.
+
+- `quota_monitor::finish_confirm`: `uri_delivery_unconfirmed` now keeps
+  the durable `awaiting_client` resolution (outcome genuinely unknown)
+  instead of `failed`. It still increments `consecutive_failures` for the
+  circuit breaker.
+- `quota_monitor::finish_manual_switch`: same treatment — the record
+  survives as `awaiting_client` rather than being dropped.
+- Gates already enforce the rest: `awaiting_client` blocks a second
+  `begin_manual_switch` (`switch_in_progress`), a re-`confirm`
+  (`suggestion_already_resolved`, fail-closed on any non-retryable
+  resolution), and `set_config`. `mark_verified` resolves it to
+  `verified`; `dismiss` closes it when the user abandons.
+- UI: the manual modal now shows a distinct "结果未知" hint and keeps the
+  验证生效 button for `uri_delivery_unconfirmed`; the banner prints
+  "结果未知：Devin 可能仍在处理该登录" plus verify/dismiss for that code.
+- New Rust tests: `unconfirmed_delivery_keeps_record_awaiting_and_blocks_retry`,
+  `confirm_path_unconfirmed_delivery_stays_awaiting` (120/0 green).
+
+Line-ending note: the repo mixes CRLF files (ui-smoke.cjs, main.tsx,
+style.css, windsurf.ts, lib.rs, SettingsPage.tsx — CRLF in HEAD) with LF
+files. `git diff --check` flags every added `\r` on the CRLF files unless
+invoked as `git -c core.whitespace=cr-at-eol diff --check` (clean).
+
+## 2026-10-17c — Stale awaiting_client reconcile UX
+
+Observed live: an abandoned `awaiting_client` manual record blocked every
+later 「免重启」 click with `switch_in_progress` — the modal showed only
+the error + 关闭, so nothing was dispatched and it looked like "no
+reaction". The reconcile entry already existed on the banner (verify /
+dismiss via `in_flight_decision`), but the modal hid it.
+
+- `nativeLaunch` failure path now fetches `get_rotation_status`; when a
+  durable in-flight record exists (`executing`/`awaiting_client`), the
+  modal shows 上一次请求的目标账号 and explains that NO new URI was sent,
+  plus two reconcile actions: 「验证生效」 (runs the read-only session
+  check against the *previous record's* target — not the clicked card) and
+  「放弃并重试」 (`dismiss_rotation` → back to the pre-launch step so a
+  fresh launch always requires a new explicit click).
+- ui-smoke: `try_native_switch` mock now rejects a second launch while a
+  manual record is awaiting (matching `begin_manual_switch`), and a new
+  block exercises blocked → reconcile → abandon → relaunch.
+
+## 2026-10-17d — Stronger delivery evidence, remote probe, launch timeout
+
+Reviewer feedback round: (1) "new log session dir" only proved a second
+Devin.exe spawned — not handler acceptance; (2) verification was purely
+local-session; (3) the launcher wait had no total timeout.
+
+- **Two-level delivery evidence** (`native_switch.rs`): before launch we
+  snapshot every `window*/renderer.log` under the client's logs root with
+  its byte length; after the launcher exits we poll ~6s. A new session dir
+  → `ClientProcess`; URI-handler trace markers appended to a renderer log
+  (`maybeHandleUriWithToken`, `handleAuthToken`, `handleCodeiumAuthToken`,
+  `auth redirect URI`) → `ExtensionHandler` (stronger: the URI reached the
+  extension's auth code path). Neither → `uri_delivery_unconfirmed`, and
+  the durable record still stays `awaiting_client` — unknown is not failed.
+  When no logs dir exists at all the launch also reports unconfirmed rather
+  than silently succeeding.
+- **Launcher bound**: the PowerShell `try_wait` loop now has a 15s hard
+  deadline — a hung dispatcher is killed and the delivery probe still runs,
+  so the operation can no longer wait forever while holding CLIENT_LOCK.
+- **Remote probe after local verify** (`verify` → async): on a local
+  identity match we additionally call read-only `GetUserStatus` with the
+  client's *current* session token. `Verified.remoteStatus`:
+  `passed` (backend accepts the token) / `rejected` (401/403) /
+  `unavailable` (network/parse/no token). Still not proof the ACP agent
+  uses the identity — the UI keeps asking for one AI request — but a
+  rejected token now surfaces instead of looking like success. Frontend
+  shows the remote result in both the modal and the banner.
+- New test: `uri_handler_markers_match_real_log_traces` (121/0 green).
+
+## 2026-10-17e — Five-issue review round: in-flight gate, stale-offer revocation, policy fixes
+
+Reviewer found five logic issues (P1 x2, P2 x3). All fixed; 128/0 tests.
+
+- **P1 standard switch bypassed in-flight native op**: manual
+  `inject_windsurf_to_vscode` only held the client locks — once a URI
+  launch returned, the lock was free while the client might still process
+  the login, so a restart switch could race it. New shared gate
+  `QuotaMonitor::ensure_no_in_flight_switch` (rejects with
+  `in_flight_switch_pending` while any durable record is `executing` or
+  `awaiting_client`) is wired into the standard-switch entry (lib.rs ~248)
+  AND the recovery restore (`restore_last_client_state`, ~330). Verify /
+  dismiss remain the only exits.
+- **P1 stale low-quota offer stayed confirmable after recovery**: two
+  layers. (a) `switch_adapter::validate` now re-checks the *current*
+  account before execution — its snapshot must exist, be fresh
+  (`snapshot_max_age_secs`), healthy, verified-semantics, and still
+  `is_low(threshold)`; new codes `current_snapshot_missing`,
+  `current_snapshot_stale`, `current_query_unhealthy`,
+  `current_semantics_unverified`, `current_no_longer_low` (the last covers
+  both "recovered" and "limits unmeasurable" since `is_low` is false for
+  both). `begin_confirm` passes the monitor's own latest snapshot map, so
+  a missing scan fails closed. (b) The scan now *durably revokes* a
+  still-open offer (`resolution: None` or retryable `failed`) for the
+  current account whenever `clear_low_observation` fires — the trigger
+  condition is gone, not just the banner.
+- **P2 NotifyOnly required a backup**: `evaluate` now returns
+  `Warning("low_quota_notify_only")` immediately after a confirmed
+  verified-low current account, before candidate selection — an empty
+  pool no longer suppresses the warning. `clear_low_observation` stays
+  true.
+- **P2 unverified-semantics warning did not clear the observation**: the
+  scan bookkeeping now applies `decision.clear_low_observation` for every
+  decision kind (was: only `Blocked`/`NoAction`). A verified-low →
+  unverified → verified-low sequence restarts the double-confirmation
+  window from zero instead of resuming the stale streak.
+- **P2 standard completion overclaimed verification**: the restart path
+  proves local write + identity only. `confirm_rotation` now calls new
+  `mark_executed` (resolution `executed`) instead of `mark_verified`;
+  the banner shows "本地写入校验通过并已重启客户端；账号与服务连接待确认"
+  for `executed`, and "已完成切换并通过官方会话验证" only for `verified`
+  (native read-only session check). `client_recognized` stays `Unknown`,
+  `remote_verified` stays `NotAttempted` for the standard outcome.
+
+New tests: `confirm_rejected_when_current_no_longer_low` (+2 sibling
+rejection cases), `notify_only_warns_without_backup`,
+`in_flight_gate_blocks_side_paths_until_reconciled`,
+`standard_completion_records_executed_not_verified`,
+`scan_revokes_open_offer_once_current_recovers`,
+`warning_clears_observation_and_next_low_restarts_fresh` → 128/0.

@@ -1,0 +1,65 @@
+/* Reference-inspired account workspace; interaction and grid breakpoints
+   remain owned by style.css. */
+:root:not([data-theme=dark]) {
+ --bg:#f5f8fe; --sidebar:#f7faff; --surface:#fff;
+ --surface-soft:#f2f6fc; --text:#17243b; --muted:#6b7890;
+ --border:#e3eaf5; --accent:#1674ff; --accent-hover:#0864ec;
+ --tint:#eaf2ff; --shadow:0 5px 20px #253f6f06;
+}
+:root:not([data-theme=dark]) body {
+ background:radial-gradient(ellipse at 92% 0,#e8f2ff 0,transparent 45%),var(--bg);
+}
+.sidebar { background:var(--sidebar); }
+.sidebar .nav-item.active { box-shadow:inset 0 0 0 1px #1674ff05; }
+.sidebar .settings-nav { border-radius:0; }
+.page-heading { margin-bottom:24px; }
+.page-heading h1 { font-size:30px; font-weight:750; letter-spacing:-1px; }
+.page-heading p { font-size:13px; }
+.primary { box-shadow:0 4px 12px #1674ff18; }
+.primary:hover:not(:disabled) { box-shadow:0 5px 16px #1674ff28; }
+.account-section>.section-heading {
+ margin:0; padding:17px 17px 16px; background:var(--surface);
+ border:1px solid var(--border); border-bottom:0; border-radius:17px 17px 0 0;
+}
+.section-heading h2>span { border-radius:50%; padding:5px 8px; color:var(--accent); background:var(--tint); }
+.account-section>.toolbar {
+ padding:0 17px 16px; margin:0 0 17px; background:var(--surface);
+ border:1px solid var(--border); border-top:0; border-radius:0 0 17px 17px;
+ box-shadow:0 8px 24px #253f6f04;
+}
+.toolbar .search-field,.toolbar select,.toolbar .view-toggle { height:40px; border-radius:9px; }
+.toolbar .view-toggle button { height:32px; width:32px; }
+.toolbar .selected { box-shadow:0 0 0 1px #1674ff30; }
+.grid .account { border-radius:17px; min-height:400px; box-shadow:var(--shadow); }
+.grid .account:hover { border-color:#9dbce9; box-shadow:0 8px 24px #294c8510; }
+.grid .account.current { border:1px solid var(--accent); box-shadow:0 0 0 1px var(--accent),0 8px 24px #1674ff12; }
+.grid .avatar { width:44px; height:44px; border-radius:50%; border:0; font-size:21px; background:#e7efff; color:#255fc8; }
+.grid .account:nth-child(3n+2) .avatar { background:#ece6ff; color:#7050b6; }
+.grid .account:nth-child(3n) .avatar { background:#ffede3; color:#9c654b; }
+.grid .current .avatar { background:#e1edff; color:#155bd6; box-shadow:0 0 0 5px #1674ff08; }
+.grid .card-identity { gap:12px; }
+.grid .card-meta { margin:17px 0 14px; min-height:28px; }
+.grid .badge { color:#16845f; background:#eaf9f1; border-radius:18px; }
+.grid .badge .dot { background:#20c58a; }
+.grid .plan-badge { border:0!important; border-radius:8px!important; }
+.grid .plan-pro { background:linear-gradient(120deg,#e7daff,#eee8ff)!important; }
+.grid .account-quota { border:0; background:var(--surface-soft); border-radius:13px; padding:15px 13px; }
+.grid .quota-heading>span { color:var(--muted); }
+.grid .quota-heading strong { font-weight:600; }
+.grid .quota-track { height:7px; background:#dfe5ef; border-radius:6px; }
+.grid .quota-track>span { background:linear-gradient(90deg,#1c80ff,#1467f9); }
+.grid .quota-meter.low .quota-track>span { background:#db922a; }
+.grid .quota-meters { gap:19px; }
+.grid .quota-updated { border-top:1px solid var(--border); padding-top:11px; margin-top:15px; }
+.grid .card-actions { border-color:var(--border); gap:6px; }
+.grid .card-actions .icon-button { border:1px solid var(--border); border-radius:9px; width:32px; height:34px; }
+.grid .switch-button { border-radius:9px; }
+:root[data-theme=dark] .grid .avatar { filter:brightness(.8); }
+:root[data-theme=dark] .grid .quota-track { background:#ffffff15; }
+:root[data-theme=dark] .grid .badge { color:#73d6b2; background:#173d32; }
+@media(max-width:760px) {
+ .page-heading h1 { font-size:25px; }
+ .account-section>.section-heading { padding:13px; gap:10px; }
+ .account-section>.toolbar { padding:0 13px 13px; }
+ .grid .account { min-height:375px; }
+}

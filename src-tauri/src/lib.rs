@@ -50,6 +50,14 @@ async fn add_windsurf_account_with_token(
         .map(|a| AccountView::from(&a))
 }
 #[tauri::command]
+async fn add_windsurf_account_with_password(
+    email: String,
+    password: String,
+) -> Result<AccountView, String> {
+    accounts::upsert_account(auth::build_payload_from_password(&email, &password).await?)
+        .map(|a| AccountView::from(&a))
+}
+#[tauri::command]
 async fn import_windsurf_from_local() -> Result<Vec<AccountView>, String> {
     let _guard = CLIENT_LOCK
         .try_lock()
@@ -232,17 +240,31 @@ async fn inject_windsurf_to_vscode(account_id: String) -> Result<SwitchResult, S
         .try_lock()
         .map_err(|_| "正在操作客户端，请稍后再试")?;
     let _file_guard = modules::process::lock_client_operation()?;
+    // A durable in-flight record means an official `devin://` login may
+    // still be processed by the running client — a restart switch now
+    // would race it and could leave Devin on a different account than the
+    // one written here.
+    modules::quota_monitor::global()
+        .ensure_no_in_flight_switch()
+        .map_err(|code| modules::quota_monitor::confirm_error_message(&code))?;
+    inject_windsurf_to_vscode_inner(&account_id).await
+}
+
+/// The standard restart switch body, callable without re-acquiring the
+/// client locks — `confirm_rotation` already holds them when it dispatches
+/// here for the default (standard) switch method.
+async fn inject_windsurf_to_vscode_inner(account_id: &str) -> Result<SwitchResult, String> {
     client::detect_and_save_windsurf_launch_path(false)
         .ok_or("未找到 Devin Desktop，请先安装或设置路径")?;
     client::ensure_windsurf_launch_path_configured()?;
-    let account = accounts::load_account(&account_id).ok_or("账号不存在")?;
+    let account = accounts::load_account(account_id).ok_or("账号不存在")?;
     // Unlike upstream's warning-only fallback, do not inject stale auth1 credentials after a failed refresh.
     if account
         .devin_auth1_token
         .as_deref()
         .is_some_and(|s| s.starts_with("auth1_"))
     {
-        accounts::refresh_account_token(&account_id)
+        accounts::refresh_account_token(account_id)
             .await
             .map_err(|e| format!("切换前刷新失败，未修改客户端：{}", e))?;
     }
@@ -252,15 +274,15 @@ async fn inject_windsurf_to_vscode(account_id: String) -> Result<SwitchResult, S
         return Err("请先启动官方客户端完成初始化和登录".into());
     }
     modules::auth_endpoint::validate_account(
-        &accounts::load_account(&account_id).ok_or("账号不存在")?,
+        &accounts::load_account(account_id).ok_or("账号不存在")?,
     )?;
     let was_running = client::profile_is_running(&profile);
     client::close_windsurf(&[profile.to_string_lossy().into_owned()], 20)?;
     let result = modules::client_recovery::guarded_with_close(
         &profile,
         || {
-            client::inject_account_to_profile(&profile, &account_id)?;
-            if current_account_id().as_deref() != Some(&account_id) {
+            client::inject_account_to_profile(&profile, account_id)?;
+            if current_account_id().as_deref() != Some(account_id) {
                 return Err("客户端本地登录态校验失败".into());
             }
             client::start_windsurf_default_with_args_with_new_window(&[], true)?;
@@ -280,7 +302,7 @@ async fn inject_windsurf_to_vscode(account_id: String) -> Result<SwitchResult, S
         }
     };
     let verified = true;
-    let message = if accounts::mark_switched(&account_id).is_ok() {
+    let message = if accounts::mark_switched(account_id).is_ok() {
         "已写入目标账号并启动客户端，请在 Devin Desktop 确认账号及服务连接。"
     } else {
         "账号已写入并启动，但最近切换记录未能保存；请检查本地目录权限。"
@@ -302,6 +324,11 @@ async fn restore_last_client_state() -> Result<String, String> {
         .try_lock()
         .map_err(|_| "正在操作客户端，请稍后再试")?;
     let _file_guard = modules::process::lock_client_operation()?;
+    // Restoring the client DB while an official `devin://` login may still
+    // be processing would resurrect a pre-login state over a live request.
+    modules::quota_monitor::global()
+        .ensure_no_in_flight_switch()
+        .map_err(|code| modules::quota_monitor::confirm_error_message(&code))?;
     let profile = client::get_default_windsurf_user_data_dir()?;
     modules::client_recovery::preflight(&profile)?;
     let was_running = client::profile_is_running(&profile);
@@ -402,16 +429,20 @@ fn get_switch_capabilities() -> SwitchCapabilitiesDto {
 }
 
 /// Confirm a pending recommendation. Phase A re-validates everything
-/// server-side (gate); phase B dispatches to the native URI-login adapter,
-/// which only *launches* the official `devin://` login — the client's own
-/// confirmation modal is the second gate and no client files are touched.
-/// A blocked/failed adapter outcome performs zero writes.
+/// server-side (gate); phase B dispatches by the user's switch-method
+/// preference: `native` → the experimental official `devin://` URI login;
+/// anything else (the default `standard`) → the standard save-and-restart
+/// switch. A blocked/failed adapter outcome performs zero writes.
 #[tauri::command]
 async fn confirm_rotation(
     suggestion_id: String,
     target_account_id: String,
     expected_current_account_id: Option<String>,
+    switch_method: Option<String>,
 ) -> Result<modules::switch_adapter::SwitchOutcome, String> {
+    use modules::switch_adapter::{
+        AdapterKind, RollbackStatus, SwitchOutcome, Verification,
+    };
     // Same serialization domain as manual switching/recovery: a rotation
     // launch must not overlap any other client operation.
     let _guard = CLIENT_LOCK
@@ -429,8 +460,49 @@ async fn confirm_rotation(
     };
     let monitor = modules::quota_monitor::global();
     monitor.begin_confirm(current, &request)?;
-    let outcome = modules::native_switch::execute(&request.target_account_id).await;
+    let outcome = if switch_method.as_deref() == Some("native") {
+        modules::native_switch::execute(&request.target_account_id).await
+    } else {
+        // Default: standard save-and-restart. The inject path already
+        // re-validates, backs up, writes, restarts and verifies the local
+        // session — a success is a completed switch, not a pending one.
+        match inject_windsurf_to_vscode_inner(&request.target_account_id).await {
+            Ok(r) => SwitchOutcome {
+                target_account_id: request.target_account_id.clone(),
+                adapter: Some(AdapterKind::SafeRestart),
+                restart_required: true,
+                local_match: if r.local_verified {
+                    Verification::Passed
+                } else {
+                    Verification::Unknown
+                },
+                client_recognized: Verification::Unknown,
+                remote_verified: Verification::NotAttempted,
+                rollback: RollbackStatus::NotNeeded,
+                failure_code: None,
+                message: r.message,
+            },
+            Err(e) => {
+                let mut o = SwitchOutcome::blocked(
+                    &request.target_account_id,
+                    "standard_switch_failed",
+                    format!("标准切号失败: {e}"),
+                );
+                o.adapter = Some(AdapterKind::SafeRestart);
+                o.restart_required = true;
+                o
+            }
+        }
+    };
     monitor.finish_confirm(&request, &outcome);
+    // A completed standard restart passed the local write+identity check
+    // only — record `executed` (cooldown/last-switch bookkeeping), NOT
+    // `verified`: client recognition and remote ACP status are unconfirmed.
+    // The native path stays `awaiting_client` until `verify_native_login`
+    // observes the official session change.
+    if outcome.adapter == Some(AdapterKind::SafeRestart) && outcome.failure_code.is_none() {
+        monitor.mark_executed(&request.target_account_id);
+    }
     Ok(outcome)
 }
 
@@ -438,11 +510,11 @@ async fn confirm_rotation(
 /// switch to the target account? On `verified` the monitor records the
 /// completed switch (cooldown + last-switch timestamp).
 #[tauri::command]
-fn verify_native_login(
+async fn verify_native_login(
     target_account_id: String,
 ) -> Result<modules::native_switch::NativeVerifyResult, String> {
-    let result = modules::native_switch::verify(&target_account_id)?;
-    if matches!(result, modules::native_switch::NativeVerifyResult::Verified { .. }) {
+    let result = modules::native_switch::verify(&target_account_id).await?;
+    if result.completes_switch() {
         modules::quota_monitor::global().mark_verified(&target_account_id);
     }
     Ok(result)
@@ -460,7 +532,25 @@ async fn try_native_switch(
         .try_lock()
         .map_err(|_| "正在操作客户端，请稍后再试")?;
     let _file_guard = modules::process::lock_client_operation()?;
-    Ok(modules::native_switch::execute(&account_id).await)
+    // Same durable in-flight record as the recommendation path: persisted
+    // BEFORE the URI launch so a crash is recoverable, and every gate
+    // (recovery, concurrent confirm, second manual launch, config save)
+    // sees the operation.
+    let monitor = modules::quota_monitor::global();
+    let record_id = monitor
+        .begin_manual_switch(&account_id, current_account_id())
+        .map_err(|code| match code.as_str() {
+            "recovery_review_required" => {
+                "轮换状态从备份恢复，请先核对当前登录账号".to_string()
+            }
+            "switch_in_progress" => {
+                "已有切换等待官方客户端确认，请先验证或关闭后再发起".to_string()
+            }
+            other => other.to_string(),
+        })?;
+    let outcome = modules::native_switch::execute(&account_id).await;
+    monitor.finish_manual_switch(&record_id, &outcome);
+    Ok(outcome)
 }
 
 /// Dismiss the pending recommendation without executing anything.
@@ -487,6 +577,14 @@ fn cleanup_legacy_client_backups() -> Result<usize, String> {
 }
 
 pub fn run() {
+    // The guard stays alive throughout the blocking event loop. A duplicate
+    // launch only activates the existing manager; it never starts a second
+    // quota monitor or reads/writes the shared rotation state.
+    let Some(_instance_guard) = modules::app_instance::acquire()
+        .expect("无法取得管理器实例锁") else {
+        modules::app_instance::show_existing();
+        return;
+    };
     tauri::Builder::default()
         .setup(|app| {
             let monitor = modules::quota_monitor::global();
@@ -504,6 +602,7 @@ pub fn run() {
             import_windsurf_from_json,
             import_cockpit_accounts,
             add_windsurf_account_with_token,
+            add_windsurf_account_with_password,
             import_windsurf_from_local,
             refresh_windsurf_token,
             windsurf_oauth_login_start,
@@ -531,7 +630,13 @@ pub fn run() {
             restore_last_client_state,
             open_official_client,
             set_client_path,
-            inject_windsurf_to_vscode
+            inject_windsurf_to_vscode,
+            modules::connection_diagnostics::run_connection_diagnostics,
+            modules::connection_diagnostics::get_last_diagnostics,
+            modules::connection_diagnostics::export_diagnostics_report,
+            modules::connection_diagnostics::apply_client_proxy_fix,
+            modules::connection_diagnostics::clear_stale_pac_config,
+            modules::connection_diagnostics::restart_devin_client
         ])
         .run(tauri::generate_context!())
         .expect("Devin Switcher could not start");

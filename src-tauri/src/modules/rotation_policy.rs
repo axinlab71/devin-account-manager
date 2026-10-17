@@ -288,6 +288,12 @@ pub fn evaluate(
         }
     }
 
+    // Notifications do not execute a switch: neither the switch cooldown
+    // nor the candidate pool should hide an already confirmed low quota.
+    if config.mode == RotationMode::NotifyOnly {
+        return RotationDecision::warning("low_quota_notify_only");
+    }
+
     // Global minimum interval between executed switches.
     if let Some(last) = state.last_switch_at_ms {
         if now_ms - last < (config.min_switch_interval_secs as i64) * 1000 {
@@ -365,7 +371,6 @@ pub fn evaluate(
     let expires = now_ms + (config.snapshot_max_age_secs as i64) * 1000;
 
     match config.mode {
-        RotationMode::NotifyOnly => RotationDecision::warning("low_quota_notify_only"),
         // Auto requires verified capability; absent evidence it degrades to
         // the same confirmed-recommendation behaviour as SmartConfirm.
         RotationMode::SmartConfirm | RotationMode::Auto => RotationDecision {
@@ -386,7 +391,7 @@ pub fn evaluate(
             clear_low_observation: true,
             resolution: None,
         },
-        RotationMode::Off => unreachable!(),
+        RotationMode::Off | RotationMode::NotifyOnly => unreachable!(),
     }
 }
 

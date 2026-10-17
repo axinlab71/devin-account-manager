@@ -77,6 +77,12 @@ pub fn validate_refresh(
     Ok(())
 }
 
+/// Identity signals the client session reader produces:
+/// - `_switcherDesktopAccountId`: the session's Devin user id — survives a
+///   URI/native login where the stored access token is brand new and
+///   matches none of our stored credentials.
+/// - `name`/`email`: the official session label — weaker, used only when it
+///   uniquely identifies one stored account.
 /// A shared session token alone cannot distinguish multiple organizations.
 pub fn current_id(local: &serde_json::Value, accounts: &[WindsurfAccount]) -> Option<String> {
     let text = |key: &str| {
@@ -85,6 +91,20 @@ pub fn current_id(local: &serde_json::Value, accounts: &[WindsurfAccount]) -> Op
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
     };
+    // Strongest post-login signal: the session's Devin user id vs the
+    // account's stored `devin_account_id`/auth-raw `accountId`. Works even
+    // when the client's new session token is unknown to us.
+    if let Some(desktop_id) = text("_switcherDesktopAccountId") {
+        let matches: Vec<_> = accounts
+            .iter()
+            .filter(|a| scope(a).0 == Some(desktop_id))
+            .collect();
+        if matches.len() == 1 {
+            return Some(matches[0].id.clone());
+        }
+        // Ambiguous (same Devin user under different stored orgs) — fall
+        // through to the token check which may still disambiguate.
+    }
     let matches: Vec<_> = accounts
         .iter()
         .filter(|a| {
@@ -101,6 +121,36 @@ pub fn current_id(local: &serde_json::Value, accounts: &[WindsurfAccount]) -> Op
                         || a.windsurf_auth_token.as_deref() == Some(t)
                         || a.github_access_token == t
                 })
+        })
+        .collect();
+    if matches.len() == 1 {
+        return Some(matches[0].id.clone());
+    }
+    // Last resort: the official session label exactly equals one stored
+    // identity (login/email/name/auth-raw fields). Same rule as the
+    // native-switch verify fallback — only a unique match counts.
+    let label = text("name").or_else(|| text("email"))?;
+    let lower = label.trim().to_lowercase();
+    let matches: Vec<_> = accounts
+        .iter()
+        .filter(|a| {
+            let raw = a.windsurf_auth_status_raw.as_ref();
+            let raw_field = |p: &str| raw.and_then(|v| v.pointer(p)).and_then(|v| v.as_str());
+            [
+                Some(a.github_login.as_str()),
+                a.github_name.as_deref(),
+                a.github_email.as_deref(),
+                a.devin_account_id.as_deref(),
+                raw_field("/name"),
+                raw_field("/email"),
+                raw_field("/user/name"),
+                raw_field("/user/email"),
+                raw_field("/account/label"),
+            ]
+            .iter()
+            .flatten()
+            .map(|s| s.trim().to_lowercase())
+            .any(|c| !c.is_empty() && c == lower)
         })
         .collect();
     if matches.len() == 1 {

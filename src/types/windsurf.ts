@@ -33,6 +33,9 @@ export interface WindsurfAccount {
   usage_proto_b64?: string | null;
   display_token_claims?: Record<string,string>;
   credential_state?: 'unverified' | 'expired';
+  /** 后端只读判定：账号是否持有官方 URI 登录可用凭据（不含凭据本身）。
+   *  仅表示凭据条件满足，不代表官方客户端已验证会接受免重启登录。 */
+  native_switch_credential_ready?: boolean;
   last_switched_at?: number | null;
   credentials_updated_at?: number | null;
   usage_updated_at?: number | null;
@@ -1279,4 +1282,109 @@ export function formatWindsurfResetTimeAbsolute(resetTime: number | null | undef
   const hours = pad(date.getHours());
   const minutes = pad(date.getMinutes());
   return `${month}/${day} ${hours}:${minutes}`;
+}
+
+// ---- 连接诊断与修复（对应后端 src-tauri/src/modules/connection_diagnostics.rs，serde camelCase） ----
+
+/** CheckStatus（serde snake_case）：confirmed_issue / ok / unknown */
+export type DiagnosticCheckStatus = 'confirmed_issue' | 'ok' | 'unknown';
+
+export interface DiagnosticItem {
+  id: string;
+  group: string;
+  title: string;
+  status: DiagnosticCheckStatus;
+  detail: string;
+  evidence: string[];
+}
+
+export interface ClientDiagnostics {
+  exePath: string | null;
+  exeExists: boolean;
+  productVersion: string | null;
+  productCommit: string | null;
+  fileVersion: string | null;
+  dataDir: string | null;
+  dataDirExists: boolean;
+  userSettingsExists: boolean;
+  cliLogDirExists: boolean;
+  ideProcessesRunning: number;
+  agentProcessesRunning: number;
+}
+
+export interface ProxySection {
+  systemProxyEnabled: boolean;
+  systemProxyServer: string | null;
+  systemProxyListening: boolean | null;
+  pacDetected: boolean;
+  pacTarget: string | null;
+  pacListening: boolean | null;
+  envProxies: string[];
+  devinSettingsProxy: string | null;
+  devinAgentEnvKeys: string[];
+  confirmedProxyIssue: boolean;
+  stalePacConfirmed: boolean;
+  ineffectiveProxyConfirmed: boolean;
+  listeningLocalPorts: number[];
+}
+
+export interface ProbeTiming {
+  attempts: number;
+  successes: number;
+  minMs: number;
+  maxMs: number;
+}
+
+export interface NetworkProbeResult {
+  host: string;
+  dnsOk: boolean;
+  resolvedIp: string | null;
+  tcp: ProbeTiming | null;
+  tls: ProbeTiming | null;
+  classification: string;
+  riskNote: string | null;
+}
+
+export interface LogDiagnostics {
+  logDir: string;
+  totalLogFiles: number;
+  logsExamined: number;
+  agentStarts: number;
+  authenticateAttempts: number;
+  authenticateWithCredentials: number;
+  teamSettingsFailures: number;
+  timeoutFailures: number;
+  zdrTimeouts: number;
+  remoteConfigFailures: number;
+  lastFailureAt: string | null;
+  agentVersions: string[];
+  runningAgentPids: number[];
+  runningAgentsAuthenticated: boolean | null;
+  newestLogHasAuthFailure: boolean;
+}
+
+export interface RecommendedFix {
+  id: string;
+  label: string;
+  requiresRestart: boolean;
+  affectsLogin: boolean;
+  manual: boolean;
+}
+
+export interface SummarySection {
+  category: string;
+  confidence: string;
+  overview: string;
+  recommendedFixes: RecommendedFix[];
+}
+
+export interface DiagnosticsResult {
+  generatedAtMs: number;
+  appVersion: string;
+  items: DiagnosticItem[];
+  client: ClientDiagnostics;
+  proxy: ProxySection;
+  network: NetworkProbeResult[];
+  logs: LogDiagnostics;
+  summary: SummarySection;
 }

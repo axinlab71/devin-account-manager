@@ -291,31 +291,34 @@ async fn windsurf_post_auth(
 pub(crate) async fn get_one_time_auth_token(
     client: &Client,
     session_token: &str,
-    auth1: &str,
-    account_id: &str,
-    org_id: &str,
+    auth1: Option<&str>,
+    account_id: Option<&str>,
+    org_id: Option<&str>,
 ) -> Result<String, String> {
     let body = encode_string_field(1, session_token);
 
     let mut last_err = String::new();
     for attempt in 1..=3u32 {
-        let resp = crate::modules::auth_transport::send(
-            client
-                .post(GET_OTT_URL)
-                .header("Content-Type", "application/proto")
-                .header("connect-protocol-version", "1")
-                .header("Accept", "application/proto")
-                .header("Origin", "https://windsurf.com")
-                .header("Referer", "https://windsurf.com/editor/auth-success")
-                .header("x-auth-token", session_token)
-                .header("x-devin-session-token", session_token)
-                .header("x-devin-account-id", account_id)
-                .header("x-devin-primary-org-id", org_id)
-                .header("x-devin-auth1-token", auth1)
-                .body(body.clone()),
-            Some(UA),
-        )
-        .await;
+        let mut request = client
+            .post(GET_OTT_URL)
+            .header("Content-Type", "application/proto")
+            .header("connect-protocol-version", "1")
+            .header("Accept", "application/proto")
+            .header("Origin", "https://windsurf.com")
+            .header("Referer", "https://windsurf.com/editor/auth-success")
+            .header("x-auth-token", session_token)
+            .header("x-devin-session-token", session_token);
+        if let Some(account_id) = account_id {
+            request = request.header("x-devin-account-id", account_id);
+        }
+        if let Some(org_id) = org_id {
+            request = request.header("x-devin-primary-org-id", org_id);
+        }
+        if let Some(auth1) = auth1 {
+            request = request.header("x-devin-auth1-token", auth1);
+        }
+        let resp = crate::modules::auth_transport::send(request.body(body.clone()), Some(UA))
+            .await;
         match resp {
             Ok(r) => {
                 let status = r.status();
@@ -503,7 +506,7 @@ pub async fn full_refresh_from_auth1(auth1_token: &str) -> Result<DevinFullRefre
 
     // Step 2: GetOneTimeAuthToken
     let ott =
-        get_one_time_auth_token(&client, &session_token, &auth1_back, &account_id, &org_id).await?;
+        get_one_time_auth_token(&client, &session_token, Some(&auth1_back), Some(&account_id), Some(&org_id)).await?;
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // Step 3: RegisterUser → ide_token (机器绑定)

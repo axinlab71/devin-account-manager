@@ -1,4 +1,5 @@
 pub mod account;
+pub mod app_instance;
 pub mod account_identity;
 pub mod account_index_repair;
 pub mod account_selector;
@@ -11,6 +12,7 @@ pub mod client_recovery;
 pub mod client_version;
 pub mod cockpit_migration;
 pub mod config;
+pub mod connection_diagnostics;
 pub mod deferred_account_rewrite;
 pub mod key_protection;
 pub mod logger;

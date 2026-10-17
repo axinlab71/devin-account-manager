@@ -715,7 +715,7 @@ pub fn global() -> &'static QuotaMonitor {
 }
 
 impl QuotaMonitor {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Mutex::new(MonitorInner {
                 state: rotation_state::load(),
@@ -788,7 +788,11 @@ impl QuotaMonitor {
             .unwrap_or(0.0);
         Some(rotation_policy::RotationDecision {
             kind: rotation_policy::DecisionKind::Recommendation,
-            reasons: vec!["switch_in_progress".into()],
+            reasons: vec![if r.id.starts_with("manual-") {
+                "manual_switch".into()
+            } else {
+                "switch_in_progress".into()
+            }],
             target: Some(rotation_policy::CandidateSummary {
                 account_id: r.target_account_id.clone(),
                 org_id: None,
@@ -868,11 +872,14 @@ impl QuotaMonitor {
                 return Err("存在进行中的切换确认，请先完成或关闭后再修改设置".into());
             }
         }
-        inner.state.config = config;
-        rotation_state::save(&inner.state)?;
+        let mut next = inner.state.clone();
+        next.config = config;
         // New config invalidates pending recommendations and observations.
-        inner.state.last_recommendation = None;
-        inner.state.low_quota_observations.clear();
+        next.last_recommendation = None;
+        next.low_quota_observations.clear();
+        rotation_state::save(&next)?;
+        inner.state = next;
+        inner.last_decision = None;
         self.ensure_task(&mut inner);
         Self::emit_status(&inner);
         Ok(Self::status_dto(&inner))
@@ -880,9 +887,11 @@ impl QuotaMonitor {
 
     pub fn pause(&self, reason: &str) -> Result<rotation_policy::RotationStatusDto, String> {
         let mut inner = self.inner.lock().map_err(|_| "监控状态锁不可用")?;
-        inner.state.paused = true;
-        inner.state.pause_reason = Some(reason.to_string());
-        rotation_state::save(&inner.state)?;
+        let mut next = inner.state.clone();
+        next.paused = true;
+        next.pause_reason = Some(reason.to_string());
+        rotation_state::save(&next)?;
+        inner.state = next;
         self.wake.notify_one();
         Self::emit_status(&inner);
         Ok(Self::status_dto(&inner))
@@ -890,11 +899,13 @@ impl QuotaMonitor {
 
     pub fn resume(&self) -> Result<rotation_policy::RotationStatusDto, String> {
         let mut inner = self.inner.lock().map_err(|_| "监控状态锁不可用")?;
-        inner.state.paused = false;
-        inner.state.pause_reason = None;
+        let mut next = inner.state.clone();
+        next.paused = false;
+        next.pause_reason = None;
         // Resume also clears the failure breaker only via explicit user intent.
-        inner.state.consecutive_failures = 0;
-        rotation_state::save(&inner.state)?;
+        next.consecutive_failures = 0;
+        rotation_state::save(&next)?;
+        inner.state = next;
         self.ensure_task(&mut inner);
         self.wake.notify_one();
         Self::emit_status(&inner);
@@ -1069,18 +1080,27 @@ impl QuotaMonitor {
             /* auto_capable */ false,
         );
 
-        // Persist observation bookkeeping based on the decision flags.
-        match &decision.kind {
-            rotation_policy::DecisionKind::Blocked { .. }
-            | rotation_policy::DecisionKind::NoAction => {
-                if decision.clear_low_observation {
-                    if let Some(cid) = current_id.as_ref() {
-                        inner.state.low_quota_observations.remove(cid);
-                        inner.state.suppressed_at.remove(cid);
+        // Persist observation bookkeeping based on the decision flags —
+        // for EVERY decision kind: `unverified_quota_semantics` warnings
+        // must clear the observation too, or a later verified snapshot
+        // would resume a stale low-quota streak (weakening the
+        // double-confirmation protection).
+        if decision.clear_low_observation {
+            if let Some(cid) = current_id.as_ref() {
+                inner.state.low_quota_observations.remove(cid);
+                inner.state.suppressed_at.remove(cid);
+                // The trigger condition no longer holds for this account —
+                // revoke a still-open offer (pending or retryable `failed`)
+                // for it so it cannot be confirmed after recovery.
+                // In-flight and terminal records are untouched.
+                if let Some(rec) = inner.state.last_recommendation.as_mut() {
+                    if rec.from_account_id == *cid
+                        && matches!(rec.resolution.as_deref(), None | Some("failed"))
+                    {
+                        rec.resolution = Some("revoked".into());
                     }
                 }
             }
-            _ => {}
         }
         if decision.record_low_observation {
             if let Some(cid) = current_id.as_ref() {
@@ -1193,8 +1213,16 @@ impl QuotaMonitor {
         if let Ok(mut inner) = self.inner.lock() {
             if let Some(rec) = inner.state.last_recommendation.as_mut() {
                 if rec.id == request.suggestion_id {
+                    // uri_delivery_unconfirmed means the URI may still be
+                    // processed by the client — keep `awaiting_client` (the
+                    // honest "outcome unknown" state) so the user must
+                    // verify/dismiss before a second, overlapping launch;
+                    // it still counts toward the failure breaker.
                     rec.resolution = Some(
-                        if outcome.failure_code.is_some() {
+                        if outcome.failure_code.is_some()
+                            && outcome.failure_code.as_deref()
+                                != Some("uri_delivery_unconfirmed")
+                        {
                             "failed"
                         } else {
                             "awaiting_client"
@@ -1211,11 +1239,42 @@ impl QuotaMonitor {
         }
     }
 
+    /// Shared precondition for client-identity operations that bypass the
+    /// suggestion lifecycle — the manual standard restart switch and the
+    /// recovery restore both rewrite what the client sees while an official
+    /// `devin://` login may still be processing in the background. A
+    /// durable `executing`/`awaiting_client` record must be verified or
+    /// dismissed first; otherwise the two switches race.
+    pub fn ensure_no_in_flight_switch(&self) -> Result<(), String> {
+        let inner = self.inner.lock().map_err(|_| "监控状态锁不可用")?;
+        if let Some(rec) = inner.state.last_recommendation.as_ref() {
+            if matches!(
+                rec.resolution.as_deref(),
+                Some("executing") | Some("awaiting_client")
+            ) {
+                return Err("in_flight_switch_pending".into());
+            }
+        }
+        Ok(())
+    }
+
     /// Called when read-only verification observes the official client's
     /// session matching the switch target. Only applies when the matching
     /// suggestion is actually awaiting client confirmation — verification
     /// cannot upgrade an arbitrary/other-account state to `verified`.
     pub fn mark_verified(&self, target_account_id: &str) {
+        self.finish_switch(target_account_id, "verified");
+    }
+
+    /// Same switch bookkeeping as `mark_verified` but records `executed`:
+    /// the local write+restart completed and the local identity check
+    /// passed, yet no official-session or remote verification was observed.
+    /// The banner must not claim verified-level completion for it.
+    pub fn mark_executed(&self, target_account_id: &str) {
+        self.finish_switch(target_account_id, "executed");
+    }
+
+    fn finish_switch(&self, target_account_id: &str, resolution: &str) {
         if let Ok(mut inner) = self.inner.lock() {
             let now = now_ms();
             let from = inner
@@ -1230,16 +1289,18 @@ impl QuotaMonitor {
             if let Some((rec_id, from_id)) = from {
                 if let Some(rec) = inner.state.last_recommendation.as_mut() {
                     if rec.id == rec_id {
-                        rec.resolution = Some("verified".into());
+                        rec.resolution = Some(resolution.into());
                     }
                 }
                 inner.state.last_switch_at_ms = Some(now);
                 inner.state.consecutive_failures = 0;
                 inner.state.recovered_from_backup = false;
-                let cooldown_ms = (inner.state.config.cooldown_secs as i64) * 1000;
-                inner.state.cooldowns.insert(from_id.clone(), now + cooldown_ms);
-                inner.state.cooldown_reasons.insert(from_id.clone(), "switched_away".into());
-                inner.state.switched_away_at.insert(from_id, now);
+                if !from_id.is_empty() {
+                    let cooldown_ms = (inner.state.config.cooldown_secs as i64) * 1000;
+                    inner.state.cooldowns.insert(from_id.clone(), now + cooldown_ms);
+                    inner.state.cooldown_reasons.insert(from_id.clone(), "switched_away".into());
+                    inner.state.switched_away_at.insert(from_id, now);
+                }
                 let _ = rotation_state::save(&inner.state);
                 Self::emit_status(&inner);
             }
@@ -1279,6 +1340,94 @@ impl QuotaMonitor {
         Ok(())
     }
 
+    /// Manual experimental switch (account-card 免重启 entry): persist an
+    /// in-flight record BEFORE the URI is launched, so a crash leaves a
+    /// recoverable `awaiting_client` (executing is normalized to it on
+    /// load) and every gate — scan overwrite protection, `set_config`,
+    /// `begin_confirm`, a second manual launch — sees the operation.
+    /// Gate check + record write happen under the same lock. Returns the
+    /// record id on success; failure leaves no record and blocks launch.
+    pub fn begin_manual_switch(
+        &self,
+        target_account_id: &str,
+        from_account_id: Option<String>,
+    ) -> Result<String, String> {
+        let now = now_ms();
+        let mut inner = self.inner.lock().map_err(|_| "监控状态锁不可用")?;
+        if inner.state.recovered_from_backup {
+            return Err("recovery_review_required".into());
+        }
+        if let Some(rec) = inner.state.last_recommendation.as_ref() {
+            if matches!(
+                rec.resolution.as_deref(),
+                Some("executing") | Some("awaiting_client")
+            ) {
+                return Err("switch_in_progress".into());
+            }
+        }
+        let id = format!("manual-{}", now);
+        inner.state.last_recommendation = Some(rotation_state::RecommendationRecord {
+            id: id.clone(),
+            target_account_id: target_account_id.to_string(),
+            from_account_id: from_account_id.unwrap_or_default(),
+            cross_org: false,
+            created_at_ms: now,
+            // The TTL bounds the offer, not the operation — once executing,
+            // expiry is irrelevant to the in-flight lifecycle.
+            expires_at_ms: now + 10 * 60 * 1000,
+            resolution: Some("executing".into()),
+        });
+        if let Err(e) = rotation_state::save(&inner.state) {
+            inner.state.last_recommendation = None;
+            return Err(format!("无法持久化切换记录，已阻止本次执行: {}", e));
+        }
+        Self::emit_status(&inner);
+        Ok(id)
+    }
+
+    /// Phase B for a manual launch. Success → durable `awaiting_client`
+    /// (user must verify/dismiss). Pre-launch failures (credential, mint,
+    /// spawn) drop the record entirely — leaving `failed` would surface a
+    /// banner retry that the recommendation gate (`validate`) would always
+    /// reject anyway (manual targets may not be pool members or have
+    /// snapshots). `uri_delivery_unconfirmed` instead keeps
+    /// `awaiting_client`: the URI may have reached the client, so the
+    /// outcome is genuinely unknown until the user verifies or dismisses.
+    pub fn finish_manual_switch(
+        &self,
+        record_id: &str,
+        outcome: &super::switch_adapter::SwitchOutcome,
+    ) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let owned = inner
+                .state
+                .last_recommendation
+                .as_ref()
+                .is_some_and(|r| r.id == record_id);
+            if !owned {
+                return;
+            }
+            if outcome.failure_code.is_some() {
+                inner.state.consecutive_failures += 1;
+            }
+            // Delivery-unconfirmed is not a proven failure: the URI may have
+            // reached the client anyway, so the record stays `awaiting_client`
+            // (outcome unknown) instead of being dropped — a second launch
+            // then hits the switch_in_progress gate until the user reconciles.
+            let keep_awaiting = outcome.failure_code.is_none()
+                || outcome.failure_code.as_deref() == Some("uri_delivery_unconfirmed");
+            if keep_awaiting {
+                if let Some(rec) = inner.state.last_recommendation.as_mut() {
+                    rec.resolution = Some("awaiting_client".into());
+                }
+            } else {
+                inner.state.last_recommendation = None;
+            }
+            let _ = rotation_state::save(&inner.state);
+            Self::emit_status(&inner);
+        }
+    }
+
     /// Explicit user acknowledgement of a recovered-from-backup state that
     /// has no in-flight record to verify/dismiss (e.g. the backup predates
     /// any recommendation). Clears the persisted recovery gate.
@@ -1293,7 +1442,7 @@ impl QuotaMonitor {
     }
 }
 
-fn confirm_error_message(code: &str) -> String {
+pub(crate) fn confirm_error_message(code: &str) -> String {
     match code {
         "not_confirmed" => "未确认，未执行任何切换".into(),
         "recovery_review_required" => {
@@ -1307,6 +1456,15 @@ fn confirm_error_message(code: &str) -> String {
         "circuit_open_failures" => "连续失败已熔断，请先查看原因再恢复".into(),
         "current_identity_unknown" => "无法唯一确认当前账号，已停止".into(),
         "current_identity_changed" => "当前账号已变化，建议作废".into(),
+        "current_snapshot_missing" => "缺少当前账号的额度快照".into(),
+        "current_snapshot_stale" => "当前账号额度数据已过期".into(),
+        "current_query_unhealthy" => "当前账号额度查询失败，建议已作废".into(),
+        "current_semantics_unverified" => "当前账号额度语义未验证，建议已作废".into(),
+        "current_no_longer_low" => "当前账号额度已恢复，建议已作废".into(),
+        "in_flight_switch_pending" => {
+            "存在尚未核对的切换请求（可能仍在官方客户端处理中），请先验证或关闭后再操作".into()
+        }
+        "clock_anomaly" => "检测到时间异常，已停止".into(),
         "target_not_in_pool" => "目标账号不在已启用的备用池中".into(),
         "target_in_cooldown" => "目标账号仍在冷却期".into(),
         "target_snapshot_missing" => "缺少目标账号的额度快照".into(),

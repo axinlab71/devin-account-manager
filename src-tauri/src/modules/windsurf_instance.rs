@@ -1701,6 +1701,17 @@ fn sanitize_macos_gui_launch_env(cmd: &mut Command) {
 #[cfg(target_os = "linux")]
 fn sanitize_macos_gui_launch_env(_cmd: &mut Command) {}
 
+/// Drop env vars that change how the official client boots when inherited.
+/// ELECTRON_RUN_AS_NODE (set in Devin/VS Code integrated terminals and in
+/// `devin-desktop.cmd`) makes Devin.exe run in Node mode and exit with
+/// `bad option` — observed killing both the `--open-url` URI dispatch and
+/// plain relaunches. VSCODE_DEV switches user-data dirs.
+#[cfg(target_os = "windows")]
+fn sanitize_windows_gui_launch_env(cmd: &mut Command) {
+    cmd.env_remove("ELECTRON_RUN_AS_NODE");
+    cmd.env_remove("VSCODE_DEV");
+}
+
 #[cfg(target_os = "windows")]
 fn spawn_windsurf_windows(
     launch_path: &Path,
@@ -1711,6 +1722,7 @@ fn spawn_windsurf_windows(
     use std::os::windows::process::CommandExt;
 
     let mut cmd = Command::new(launch_path);
+    sanitize_windows_gui_launch_env(&mut cmd);
     cmd.creation_flags(0x08000000);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())

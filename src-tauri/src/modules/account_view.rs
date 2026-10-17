@@ -29,6 +29,10 @@ pub struct AccountView {
     pub last_switched_at: Option<i64>,
     pub credentials_updated_at: Option<i64>,
     pub credential_state: &'static str,
+    /// The account holds a credential the official URI login could
+    /// consume — a precondition only, NOT proof the client accepts it.
+    /// UI affordance; launch re-checks, success needs real validation.
+    pub native_switch_credential_ready: bool,
 }
 fn plan(raw: &str) -> Option<String> {
     let v = raw.trim().to_uppercase().replace([' ', '-'], "_");
@@ -315,6 +319,7 @@ impl From<&WindsurfAccount> for AccountView {
             } else {
                 "unverified"
             },
+            native_switch_credential_ready: super::native_switch::has_uri_compatible_credential(a),
         }
     }
 }

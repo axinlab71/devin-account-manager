@@ -492,6 +492,26 @@ fn notify_only_mode_warns() {
 }
 
 #[test]
+fn notify_only_warns_during_switch_cooldown_without_a_backup_pool() {
+    let mut cfg = cfg_monitoring(&[]);
+    cfg.mode = RotationMode::NotifyOnly;
+    let mut st = state_with(cfg);
+    st.last_switch_at_ms = Some(NOW - 1000);
+    st.low_quota_observations.insert("cur".into(), LowQuotaObservation {
+        first_at_ms: NOW - 10_000, last_at_ms: NOW, count: 2,
+    });
+    let snapshots = snaps_of(vec![snap("cur", Some("o1"), Some(8.0), Some(40.0))]);
+    let d = eval(&st, Some("cur"), &snapshots);
+    assert!(matches!(d.kind, DecisionKind::Warning));
+    assert_eq!(d.reasons, vec!["low_quota_notify_only"]);
+    assert!(d.target.is_none());
+    st.config.mode = RotationMode::SmartConfirm;
+    let d = eval(&st, Some("cur"), &snapshots);
+    assert!(matches!(d.kind, DecisionKind::Blocked));
+    assert_eq!(d.reasons, vec!["min_switch_interval"]);
+}
+
+#[test]
 fn zero_threshold_only_triggers_on_exhaustion() {
     let mut cfg = cfg_monitoring(&["b"]);
     cfg.threshold_percent = 0.0;
@@ -795,6 +815,42 @@ mod gate {
     }
 
     #[test]
+    fn confirm_rejected_when_current_no_longer_low() {
+        // The suggestion stays executable only while the trigger holds:
+        // a recovered/healthy current snapshot must revoke it at the gate.
+        let st = armed_state();
+        let recovered = snaps_of(vec![
+            snap("cur", Some("o1"), Some(80.0), Some(80.0)),
+            snap("b", Some("o1"), Some(90.0), Some(90.0)),
+        ]);
+        assert_eq!(
+            execute(&st, &recovered, &req(), Some("cur"), NOW).unwrap_err(),
+            "current_no_longer_low"
+        );
+        // Unverifiable semantics on the current snapshot also revoke.
+        let mut unver = snaps_of(vec![
+            snap("cur", Some("o1"), Some(5.0), Some(5.0)),
+            snap("b", Some("o1"), Some(90.0), Some(90.0)),
+        ]);
+        unver.get_mut("cur").unwrap().confidence = SemanticsConfidence::UnverifiedMapping;
+        assert_eq!(
+            execute(&st, &unver, &req(), Some("cur"), NOW).unwrap_err(),
+            "current_semantics_unverified"
+        );
+        // A failed current query likewise.
+        let mut failed = snaps_of(vec![
+            snap("cur", Some("o1"), Some(5.0), Some(5.0)),
+            snap("b", Some("o1"), Some(90.0), Some(90.0)),
+        ]);
+        failed.get_mut("cur").unwrap().health =
+            QueryHealth::Failed { failure: QueryFailure::Network };
+        assert_eq!(
+            execute(&st, &failed, &req(), Some("cur"), NOW).unwrap_err(),
+            "current_query_unhealthy"
+        );
+    }
+
+    #[test]
     fn valid_request_is_blocked_without_writes_not_silent_restart() {
         let st = armed_state();
         let outcome = execute(&st, &good_snaps(), &req(), Some("cur"), NOW).unwrap();
@@ -808,6 +864,56 @@ mod gate {
         assert_eq!(outcome.remote_verified, Verification::NotAttempted);
         assert_eq!(outcome.rollback, RollbackStatus::NotNeeded);
     }
+}
+
+// ---------- notify-only + observation lifecycle ----------
+
+#[test]
+fn notify_only_warns_without_any_pool_candidate() {
+    // NotifyOnly is an alert feature — an empty pool must not suppress it.
+    let mut cfg = cfg_monitoring(&[]);
+    cfg.mode = RotationMode::NotifyOnly;
+    let mut st = state_with(cfg);
+    st.low_quota_observations.insert(
+        "cur".into(),
+        LowQuotaObservation {
+            first_at_ms: NOW - 60_000,
+            last_at_ms: NOW - 30_000,
+            count: 2,
+        },
+    );
+    let d = eval(
+        &st,
+        Some("cur"),
+        &snaps_of(vec![snap("cur", Some("o1"), Some(5.0), Some(5.0))]),
+    );
+    assert!(matches!(d.kind, DecisionKind::Warning));
+    assert!(d.reasons.iter().any(|r| r == "low_quota_notify_only"));
+}
+
+#[test]
+fn unverified_semantics_warning_requests_observation_clear() {
+    // A low reading with unverified field semantics must clear the stored
+    // observation — resuming a stale streak would weaken the
+    // double-confirmation protection when verified data returns.
+    let mut st = state_with(cfg_monitoring(&["b"]));
+    st.low_quota_observations.insert(
+        "cur".into(),
+        LowQuotaObservation {
+            first_at_ms: NOW - 60_000,
+            last_at_ms: NOW - 30_000,
+            count: 3,
+        },
+    );
+    let mut cur = snap("cur", Some("o1"), Some(5.0), Some(5.0));
+    cur.confidence = SemanticsConfidence::UnverifiedMapping;
+    let d = eval(
+        &st,
+        Some("cur"),
+        &snaps_of(vec![cur, snap("b", Some("o1"), Some(90.0), Some(90.0))]),
+    );
+    assert!(matches!(d.kind, DecisionKind::Warning));
+    assert!(d.clear_low_observation);
 }
 
 // ---------- config validation ----------
@@ -958,5 +1064,485 @@ mod recovery_gate {
             .unwrap_err(),
             "suggestion_already_resolved"
         );
+    }
+}
+
+// ---------- manual experimental switch lifecycle ----------
+
+mod manual_switch {
+    use crate::modules::quota_monitor::QuotaMonitor;
+    use crate::modules::rotation_state::{self, RotationMode, RotationState};
+    use crate::modules::switch_adapter::{RollbackStatus, SwitchOutcome, Verification};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rot_manual_{}_{}_{}",
+            tag,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &dir);
+        dir
+    }
+
+    fn cleanup(dir: PathBuf) {
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn ok_outcome(target: &str) -> SwitchOutcome {
+        SwitchOutcome {
+            target_account_id: target.into(),
+            adapter: None,
+            restart_required: false,
+            local_match: Verification::NotAttempted,
+            client_recognized: Verification::NotAttempted,
+            remote_verified: Verification::NotAttempted,
+            rollback: RollbackStatus::NotNeeded,
+            failure_code: None,
+            message: "launched".into(),
+        }
+    }
+
+    #[test]
+    fn manual_launch_persists_awaiting_and_blocks_concurrent() {
+        let dir = temp_dir("persist");
+        let m = QuotaMonitor::new();
+        let id = m
+            .begin_manual_switch("target-b", Some("cur-a".into()))
+            .unwrap();
+        assert!(id.starts_with("manual-"));
+        // In-flight record is durable and surfaces as an in-flight decision
+        // marked manual_switch (banner shows manual copy, verify/dismiss).
+        let d = m.status().last_decision.unwrap();
+        assert_eq!(d.resolution.as_deref(), Some("executing"));
+        assert!(d.reasons.iter().any(|r| r == "manual_switch"));
+        // A second manual launch is rejected while the first is in-flight.
+        assert_eq!(
+            m.begin_manual_switch("target-c", None).unwrap_err(),
+            "switch_in_progress"
+        );
+        // Successful launch → durable awaiting_client.
+        m.finish_manual_switch(&id, &ok_outcome("target-b"));
+        assert_eq!(
+            rotation_state::load()
+                .last_recommendation
+                .unwrap()
+                .resolution
+                .as_deref(),
+            Some("awaiting_client")
+        );
+        // Verify marks the record; cooldown applies to a non-empty source.
+        m.mark_verified("target-b");
+        let s = rotation_state::load();
+        assert_eq!(
+            s.last_recommendation.unwrap().resolution.as_deref(),
+            Some("verified")
+        );
+        assert!(s.cooldowns.contains_key("cur-a"));
+        cleanup(dir);
+    }
+
+    #[test]
+    fn manual_launch_failure_drops_the_record() {
+        // Adapter failure means the URI never left — leaving a retryable
+        // `failed` record would surface a banner retry the recommendation
+        // gate always rejects for manual (non-pool) targets.
+        let dir = temp_dir("failure");
+        let m = QuotaMonitor::new();
+        let id = m.begin_manual_switch("target-b", None).unwrap();
+        let failed = SwitchOutcome::blocked("target-b", "uri_launch_failed", "x");
+        m.finish_manual_switch(&id, &failed);
+        assert!(rotation_state::load().last_recommendation.is_none());
+        assert!(m.status().last_decision.is_none());
+        assert_eq!(m.status().consecutive_failures, 1);
+        cleanup(dir);
+    }
+
+    #[test]
+    fn unconfirmed_delivery_keeps_record_awaiting_and_blocks_retry() {
+        // uri_delivery_unconfirmed means the URI may still reach (or be
+        // processed by) the client: the record must stay `awaiting_client`
+        // — outcome genuinely unknown — rather than being dropped, so an
+        // overlapping second launch stays gated until verify/dismiss.
+        let dir = temp_dir("unconfirmed");
+        let m = QuotaMonitor::new();
+        let id = m.begin_manual_switch("target-b", None).unwrap();
+        let unknown = SwitchOutcome::blocked("target-b", "uri_delivery_unconfirmed", "x");
+        m.finish_manual_switch(&id, &unknown);
+        assert_eq!(
+            rotation_state::load()
+                .last_recommendation
+                .unwrap()
+                .resolution
+                .as_deref(),
+            Some("awaiting_client")
+        );
+        // Still counts toward the failure breaker.
+        assert_eq!(m.status().consecutive_failures, 1);
+        // And the in-flight record blocks a second launch.
+        assert_eq!(
+            m.begin_manual_switch("target-c", None).unwrap_err(),
+            "switch_in_progress"
+        );
+        // Read-only verification resolves it if the client did process it.
+        m.mark_verified("target-b");
+        assert_eq!(
+            rotation_state::load()
+                .last_recommendation
+                .unwrap()
+                .resolution
+                .as_deref(),
+            Some("verified")
+        );
+        cleanup(dir);
+    }
+
+    #[test]
+    fn confirm_path_unconfirmed_delivery_stays_awaiting() {
+        use crate::modules::rotation_state::RecommendationRecord;
+        use crate::modules::switch_adapter::SwitchRequest;
+        let dir = temp_dir("confirm_unknown");
+        let mut st = RotationState::default();
+        st.config.mode = RotationMode::SmartConfirm;
+        st.last_recommendation = Some(RecommendationRecord {
+            id: "sug-1".into(),
+            target_account_id: "b".into(),
+            from_account_id: "cur".into(),
+            cross_org: false,
+            created_at_ms: 1,
+            expires_at_ms: i64::MAX,
+            resolution: Some("executing".into()),
+        });
+        rotation_state::save(&st).unwrap();
+        let m = QuotaMonitor::new();
+        let req = SwitchRequest {
+            suggestion_id: "sug-1".into(),
+            target_account_id: "b".into(),
+            expected_current_id: "cur".into(),
+            confirmed: true,
+        };
+        let unknown = SwitchOutcome::blocked("b", "uri_delivery_unconfirmed", "x");
+        m.finish_confirm(&req, &unknown);
+        assert_eq!(
+            rotation_state::load()
+                .last_recommendation
+                .unwrap()
+                .resolution
+                .as_deref(),
+            Some("awaiting_client"),
+            "unknown delivery must not be recorded as a confirmed failure"
+        );
+        assert_eq!(m.status().consecutive_failures, 1);
+        // A proven launch failure still lands on `failed` (retryable).
+        let failed = SwitchOutcome::blocked("b", "uri_launch_failed", "x");
+        m.finish_confirm(&req, &failed);
+        assert_eq!(
+            rotation_state::load()
+                .last_recommendation
+                .unwrap()
+                .resolution
+                .as_deref(),
+            Some("failed")
+        );
+        cleanup(dir);
+    }
+
+    #[test]
+    fn recovered_gate_blocks_manual_launch() {
+        let dir = temp_dir("gate");
+        let mut st = RotationState::default();
+        st.config.mode = RotationMode::Off;
+        st.recovered_from_backup = true;
+        rotation_state::save(&st).unwrap();
+        let m = QuotaMonitor::new();
+        assert_eq!(
+            m.begin_manual_switch("target-b", None).unwrap_err(),
+            "recovery_review_required"
+        );
+        cleanup(dir);
+    }
+
+    #[test]
+    fn in_flight_gate_blocks_side_paths_until_reconciled() {
+        // Standard restart / recovery restore share this precondition: any
+        // durable executing/awaiting record means the official client may
+        // still be processing a login — a second switch would race it.
+        let dir = temp_dir("inflight_gate");
+        let m = QuotaMonitor::new();
+        assert!(m.ensure_no_in_flight_switch().is_ok());
+        let id = m.begin_manual_switch("target-b", None).unwrap();
+        assert_eq!(
+            m.ensure_no_in_flight_switch().unwrap_err(),
+            "in_flight_switch_pending"
+        );
+        m.finish_manual_switch(&id, &ok_outcome("target-b"));
+        assert_eq!(
+            m.ensure_no_in_flight_switch().unwrap_err(),
+            "in_flight_switch_pending",
+            "awaiting_client still counts as in-flight for side paths"
+        );
+        m.dismiss(&id).unwrap();
+        assert!(m.ensure_no_in_flight_switch().is_ok());
+        cleanup(dir);
+    }
+
+    #[test]
+    fn standard_completion_records_executed_not_verified() {
+        // The restart path proves local write+identity only — the record
+        // must say `executed`, not `verified`.
+        let dir = temp_dir("executed");
+        let m = QuotaMonitor::new();
+        let id = m
+            .begin_manual_switch("target-b", Some("cur-a".into()))
+            .unwrap();
+        m.finish_manual_switch(&id, &ok_outcome("target-b"));
+        m.mark_executed("target-b");
+        let s = rotation_state::load();
+        assert_eq!(
+            s.last_recommendation.unwrap().resolution.as_deref(),
+            Some("executed")
+        );
+        assert!(s.cooldowns.contains_key("cur-a"));
+        assert!(s.last_switch_at_ms.is_some());
+        cleanup(dir);
+    }
+}
+
+// ---------- scan lifecycle: stale-offer revocation + observation reset ----------
+
+mod scan_lifecycle {
+    use super::*;
+    use crate::modules::quota_monitor::{
+        QuotaFetcher, QuotaMonitor, now_ms,
+    };
+    use crate::modules::rotation_state;
+    use crate::modules::secure_account_storage;
+    use futures::future::BoxFuture;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rot_scan_{}_{}_{}",
+            tag,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &dir);
+        dir
+    }
+
+    fn cleanup(dir: PathBuf) {
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn write_account(id: &str) {
+        let acc = WindsurfAccount {
+            id: id.into(),
+            ..Default::default()
+        };
+        let content =
+            secure_account_storage::serialize_account_file("windsurf", &acc).unwrap();
+        let dir = crate::modules::account::get_data_dir()
+            .unwrap()
+            .join("windsurf_accounts");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{id}.json")), content).unwrap();
+    }
+
+    fn snap_now(id: &str, pct: f64) -> QuotaSnapshot {
+        let mut s = snap(id, Some("o1"), Some(pct), Some(pct));
+        s.queried_at_ms = now_ms();
+        s
+    }
+
+    struct FakeFetcher {
+        snaps: HashMap<String, QuotaSnapshot>,
+    }
+
+    impl FakeFetcher {
+        fn of(list: Vec<QuotaSnapshot>) -> Self {
+            Self {
+                snaps: list.into_iter().map(|s| (s.account_id.clone(), s)).collect(),
+            }
+        }
+    }
+
+    impl QuotaFetcher for FakeFetcher {
+        fn fetch<'a>(
+            &'a self,
+            account: &'a WindsurfAccount,
+        ) -> BoxFuture<'a, Result<QuotaSnapshot, QueryFailure>> {
+            let snap = self.snaps.get(&account.id).cloned();
+            Box::pin(async move { snap.ok_or(QueryFailure::Network) })
+        }
+    }
+
+    #[test]
+    fn failed_settings_writes_leave_live_monitor_state_unchanged() {
+        let dir = temp_dir("settings_failure");
+        let mut st = RotationState::default();
+        st.paused = true;
+        st.pause_reason = Some("original".into());
+        st.consecutive_failures = 3;
+        rotation_state::save(&st).unwrap();
+        let m = QuotaMonitor::new();
+        // A directory in place of the file reliably rejects atomic replacement
+        // on Windows/Unix without touching a real user's data or permissions.
+        let path = rotation_state::state_path().unwrap();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let mut config = st.config.clone();
+        config.threshold_percent = 25.0;
+        assert!(m.set_config(config).is_err());
+        assert_eq!(m.status().config.threshold_percent, 10.0);
+        assert!(m.resume().is_err());
+        assert!(m.status().paused);
+        assert_eq!(m.status().consecutive_failures, 3);
+        assert!(m.pause("new reason").is_err());
+        assert_eq!(m.status().pause_reason.as_deref(), Some("original"));
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn consecutive_poll_scans_recommend_but_never_execute_and_revoke_on_network_error() {
+        let dir = temp_dir("poll_lifecycle");
+        write_account("cur");
+        write_account("b");
+        let mut st = RotationState::default();
+        st.config.mode = RotationMode::SmartConfirm;
+        st.config.enabled_pool = vec!["b".into()];
+        // No wall-clock sleep: this checks the production scan pipeline,
+        // with the policy's gap boundary covered by separate clock tests.
+        st.config.low_confirm_gap_ms = 0;
+        rotation_state::save(&st).unwrap();
+        let m = QuotaMonitor::new();
+        let low = FakeFetcher::of(vec![snap_now("cur", 8.0), snap_now("b", 90.0)]);
+        let first = m.run_scan_once(&low, Some("cur".into())).await.unwrap();
+        assert!(matches!(first.kind, DecisionKind::NoAction));
+        let second = m.run_scan_once(&low, Some("cur".into())).await.unwrap();
+        assert!(matches!(second.kind, DecisionKind::Recommendation));
+        assert!(second.requires_confirmation);
+        assert_eq!(second.target.unwrap().account_id, "b");
+        let persisted = rotation_state::load();
+        assert!(persisted.last_recommendation.unwrap().resolution.is_none());
+        assert!(persisted.last_switch_at_ms.is_none());
+        // Failed current query must not leave an executable old offer.
+        let broken = FakeFetcher::of(vec![snap_now("b", 90.0)]);
+        let third = m.run_scan_once(&broken, Some("cur".into())).await.unwrap();
+        assert!(matches!(third.kind, DecisionKind::Blocked));
+        assert!(third.reasons.iter().any(|r| r == "current_query_network_error"));
+        let persisted = rotation_state::load();
+        assert_eq!(persisted.last_recommendation.unwrap().resolution.as_deref(), Some("revoked"));
+        assert!(persisted.last_switch_at_ms.is_none());
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn scan_revokes_open_offer_once_current_recovers() {
+        let dir = temp_dir("revoke");
+        write_account("cur");
+        write_account("b");
+        let now = now_ms();
+        let mut st = RotationState::default();
+        st.config.mode = RotationMode::SmartConfirm;
+        st.config.enabled_pool = vec!["b".into()];
+        st.low_quota_observations.insert(
+            "cur".into(),
+            LowQuotaObservation {
+                first_at_ms: now - 60_000,
+                last_at_ms: now - 30_000,
+                count: 2,
+            },
+        );
+        rotation_state::save(&st).unwrap();
+        let m = QuotaMonitor::new();
+
+        // Scan 1: cur low + b eligible → pending recommendation.
+        let low = FakeFetcher::of(vec![snap_now("cur", 5.0), snap_now("b", 90.0)]);
+        let d1 = m.run_scan_once(&low, Some("cur".into())).await.unwrap();
+        assert!(matches!(d1.kind, DecisionKind::Recommendation));
+        assert!(rotation_state::load()
+            .last_recommendation
+            .unwrap()
+            .resolution
+            .is_none());
+
+        // Scan 2: cur recovered → the open offer must be revoked so a late
+        // confirm can no longer execute a stale suggestion.
+        let healthy = FakeFetcher::of(vec![snap_now("cur", 80.0), snap_now("b", 90.0)]);
+        let d2 = m.run_scan_once(&healthy, Some("cur".into())).await.unwrap();
+        assert!(matches!(d2.kind, DecisionKind::NoAction));
+        assert_eq!(
+            rotation_state::load()
+                .last_recommendation
+                .unwrap()
+                .resolution
+                .as_deref(),
+            Some("revoked")
+        );
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn warning_clears_observation_and_next_low_restarts_fresh() {
+        // verified-low → unverified-semantics (warning) → verified-low:
+        // the middle scan must clear the observation so the final one
+        // restarts the double-confirmation window instead of resuming it.
+        let dir = temp_dir("warn_clear");
+        write_account("cur");
+        write_account("b");
+        let mut st = RotationState::default();
+        st.config.mode = RotationMode::SmartConfirm;
+        st.config.enabled_pool = vec!["b".into()];
+        rotation_state::save(&st).unwrap();
+        let m = QuotaMonitor::new();
+
+        // Scan 1: verified low — first observation recorded.
+        let low = FakeFetcher::of(vec![snap_now("cur", 5.0), snap_now("b", 90.0)]);
+        let d1 = m.run_scan_once(&low, Some("cur".into())).await.unwrap();
+        assert!(matches!(d1.kind, DecisionKind::NoAction));
+        assert!(rotation_state::load()
+            .low_quota_observations
+            .contains_key("cur"));
+
+        // Scan 2: same low reading but unverified semantics — warning AND
+        // the stored observation must be dropped.
+        let mut unver_cur = snap_now("cur", 5.0);
+        unver_cur.confidence = SemanticsConfidence::UnverifiedMapping;
+        let unver = FakeFetcher::of(vec![unver_cur, snap_now("b", 90.0)]);
+        let d2 = m.run_scan_once(&unver, Some("cur".into())).await.unwrap();
+        assert!(matches!(d2.kind, DecisionKind::Warning));
+        assert!(rotation_state::load()
+            .low_quota_observations
+            .get("cur")
+            .is_none());
+
+        // Scan 3: verified low again — the streak restarts at count 1, so
+        // no recommendation may fire on this single new observation.
+        let low2 = FakeFetcher::of(vec![snap_now("cur", 5.0), snap_now("b", 90.0)]);
+        let d3 = m.run_scan_once(&low2, Some("cur".into())).await.unwrap();
+        assert!(matches!(d3.kind, DecisionKind::NoAction));
+        let obs = rotation_state::load()
+            .low_quota_observations
+            .get("cur")
+            .cloned()
+            .unwrap();
+        assert_eq!(obs.count, 1);
+        cleanup(dir);
     }
 }

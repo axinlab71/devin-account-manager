@@ -317,6 +317,53 @@ fn same_session_cannot_misidentify_the_current_organization() {
     );
     assert!(account_identity::current_id(&json!({"apiKey":"auth1_SECRET"}), &list).is_none());
 }
+
+#[test]
+fn current_id_matches_desktop_account_id_when_session_token_is_new() {
+    // After a devin:// URI login the client stores a brand-new session
+    // token unknown to our records; identity must come from the session's
+    // Devin user id (_switcherDesktopAccountId), not token equality.
+    let mut a = fixture();
+    a.devin_account_id = Some("account-1".into());
+    a.devin_org_id = Some("org-1".into());
+    let session = json!({
+        "apiKey": "sk-ws-NEW-UNKNOWN",
+        "name": "user@example.com",
+        "_switcherDesktopAccountId": "account-1",
+    });
+    assert_eq!(
+        account_identity::current_id(&session, &[a.clone()]),
+        Some(a.id.clone())
+    );
+    // Two stored accounts sharing the Devin user id (different orgs) stay
+    // ambiguous when the token cannot disambiguate.
+    let mut b = a.clone();
+    b.id = "other-org".into();
+    b.devin_org_id = Some("org-2".into());
+    assert!(account_identity::current_id(&session, &[a.clone(), b]).is_none());
+    // A mismatched id must NOT match on this signal.
+    let wrong = json!({"apiKey":"x","_switcherDesktopAccountId":"nope"});
+    assert!(account_identity::current_id(&wrong, &[a]).is_none());
+}
+
+#[test]
+fn current_id_falls_back_to_unique_session_label() {
+    // Accounts without a Devin user id: a unique official session label
+    // still identifies the account (same rule as native-switch verify).
+    let mut a = fixture();
+    a.github_login = "only-login".into();
+    let b = { let mut x = fixture(); x.id = "b".into(); x.github_login = "other".into(); x };
+    let session = json!({"apiKey": "sk-ws-NEW", "name": "only-login"});
+    assert_eq!(
+        account_identity::current_id(&session, &[a.clone(), b]),
+        Some(a.id.clone())
+    );
+    // Non-unique / absent label → no identification.
+    let dup = json!({"apiKey":"x","name":"only-login"});
+    let dup2 = { let mut x = a.clone(); x.id = "c".into(); x };
+    assert!(account_identity::current_id(&dup, &[a.clone(), dup2]).is_none());
+    assert!(account_identity::current_id(&json!({"apiKey":"x"}), &[a]).is_none());
+}
 #[test]
 fn refresh_metadata_does_not_change_the_last_switch_record() {
     let _l = test_support::env_lock()

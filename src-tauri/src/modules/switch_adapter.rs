@@ -190,6 +190,32 @@ pub fn validate(
         return code("current_identity_changed");
     }
 
+    // Trigger re-check: the suggestion only stays executable while the
+    // current account is still measurably low on a fresh, healthy,
+    // verified-semantics snapshot. A recovered or unverifiable current
+    // snapshot revokes the offer — confirming it later must fail.
+    let Some(cur_snap) = snapshots.get(&rec.from_account_id) else {
+        return code("current_snapshot_missing");
+    };
+    if cur_snap.queried_at_ms > now + 5_000 {
+        return code("clock_anomaly");
+    }
+    if cur_snap.queried_at_ms <= 0
+        || now - cur_snap.queried_at_ms
+            > (state.config.snapshot_max_age_secs as i64) * 1000
+    {
+        return code("current_snapshot_stale");
+    }
+    if !matches!(cur_snap.health, QueryHealth::Healthy) {
+        return code("current_query_unhealthy");
+    }
+    if cur_snap.confidence != SemanticsConfidence::Verified {
+        return code("current_semantics_unverified");
+    }
+    if !cur_snap.is_low(state.config.threshold_percent) {
+        return code("current_no_longer_low");
+    }
+
     // Target must still be an enabled, non-cooled-down pool member.
     if !state.config.enabled_pool.contains(&request.target_account_id) {
         return code("target_not_in_pool");
