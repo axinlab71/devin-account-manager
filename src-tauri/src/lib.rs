@@ -22,7 +22,49 @@ fn login_phase(id: &str, phase: &str) {
         *p = Some((id.into(), phase.into()));
     }
 }
-static CLIENT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static CLIENT_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+fn project_link_url(destination: &str) -> Result<&'static str, String> {
+    let url = match destination {
+        "repository" => "https://github.com/axinlab71/devin-account-manager",
+        "issues" => "https://github.com/axinlab71/devin-account-manager/issues",
+        "releases" => "https://github.com/axinlab71/devin-account-manager/releases",
+        "upstream" => "https://github.com/jlcodes99/cockpit-tools",
+        _ => return Err("不支持的项目链接".into()),
+    };
+    Ok(url)
+}
+
+#[cfg(test)]
+mod project_link_tests {
+    #[test]
+    fn project_links_use_fixed_repository_and_reject_arbitrary_destinations() {
+        assert_eq!(super::project_link_url("repository").unwrap(), "https://github.com/axinlab71/devin-account-manager");
+        assert_eq!(super::project_link_url("issues").unwrap(), "https://github.com/axinlab71/devin-account-manager/issues");
+        assert!(super::project_link_url("https://example.com").is_err());
+        assert!(super::project_link_url("file:///C:/Windows").is_err());
+    }
+}
+
+#[tauri::command]
+async fn open_project_link(destination: String) -> Result<(), String> {
+    let url = project_link_url(&destination)?;
+    open::that_detached(url).map_err(|_| "无法打开系统浏览器，请手动复制页面中的仓库地址".into())
+}
+
+#[tauri::command]
+async fn open_client_for_diagnostics() -> Result<(), String> {
+    let _guard = CLIENT_LOCK.try_lock().map_err(|_| "正在操作客户端，请稍后再试")?;
+    tokio::task::spawn_blocking(|| {
+        let _file_guard = modules::process::lock_client_operation()?;
+        modules::quota_monitor::global().ensure_no_in_flight_switch()
+            .map_err(|code| modules::quota_monitor::confirm_error_message(&code))?;
+        client::detect_and_save_windsurf_launch_path(false)
+            .ok_or("未找到 Devin Desktop，请先在客户端设置中指定路径")?;
+        client::start_windsurf_default_with_args_with_new_window(&[], false).map(|_| ())
+    }).await.map_err(|_| "打开客户端任务失败".to_string())?
+}
 
 #[tauri::command]
 fn list_windsurf_accounts() -> Result<Vec<AccountView>, String> {
@@ -629,12 +671,23 @@ pub fn run() {
             get_oauth_login_phase,
             restore_last_client_state,
             open_official_client,
+            open_project_link,
+            open_client_for_diagnostics,
+            modules::client_support::export_devin_logs,
+            modules::client_support::open_log_export_folder,
+            modules::client_support::complete_restart_devin,
+            modules::account_export::export_account_credentials,
+            modules::account_export::open_account_exports_folder,
             set_client_path,
             inject_windsurf_to_vscode,
             modules::connection_diagnostics::run_connection_diagnostics,
             modules::connection_diagnostics::get_last_diagnostics,
             modules::connection_diagnostics::export_diagnostics_report,
+            modules::connection_diagnostics::preview_diagnostics_report,
             modules::connection_diagnostics::apply_client_proxy_fix,
+            modules::connection_diagnostics::revert_client_proxy_fix,
+            modules::connection_diagnostics::get_proxy_fix_state,
+            modules::connection_diagnostics::record_recovery_feedback,
             modules::connection_diagnostics::clear_stale_pac_config,
             modules::connection_diagnostics::restart_devin_client
         ])

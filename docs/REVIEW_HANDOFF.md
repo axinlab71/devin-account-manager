@@ -587,3 +587,168 @@ rejection cases), `notify_only_warns_without_backup`,
 `standard_completion_records_executed_not_verified`,
 `scan_revokes_open_offer_once_current_recovers`,
 `warning_clears_observation_and_next_low_restarts_fresh` → 128/0.
+
+## 2026-10-17f — 模型列表诊断与恢复（connection_diagnostics 功能落地）
+
+交付范围（相对 v0.5.1 / b25e7e7 的未提交工作区）：
+
+**配置文件读写**
+- `apply_proxy_fix_to_settings` 改为顶层扁平键 `"http.proxy"` 的 JSONC
+  局部编辑：注释、尾逗号、其他字段与原格式逐字节保留；不再整文重写。
+- 历史误写的嵌套 `{"http":{"proxy":…}}` 只检测提示（`legacy_nested_
+  proxy_present`），不自动删除。
+- 事务顺序：读取原文字节 → 备份原文件 → `jsonc_set_top_level` 局部编辑
+  → `replace_secret_string_if_matches` 条件写（并发修改→中止）→ 写后
+  回读核对。任一环节失败均如实报错，不声称已恢复。
+- 文件不存在允许创建；存在但读取/解析失败直接中止。
+- 撤销：`revert_client_proxy_fix`（已注册 tauri command）仅当当前值仍
+  等于本工具上次写入值（状态文件 `proxy-fix-state.json` 比对）时移除该
+  键；被用户改过时拒绝并给出备份位置。
+
+**诊断可信度**
+- PAC：`pac_configured`（blob 里有字符串）与 `pac_active`（flags 0x04
+  真启用）分离；未启用残留不误报；blob 偏移修正（跳过 server/bypass
+  字符串再读 PAC）；截断 blob 拒绝。
+- 「无显式代理＋网络慢＋有端口监听」固定为 `unknown` 疑似，不升级
+  confirmed。
+- 端口监听 ≠ 可用代理：`apply_client_proxy_fix_inner` 先对该端口做
+  真实 HTTP CONNECT 握手（`probe_http_connect_proxy`），不通即拒绝。
+- `NetworkProbeResult.path` 标注探测路径（direct/proxy/unknown），
+  报告与界面均声明 direct 不代表 Devin 子进程实际路径。
+- 日志按运行中 PID/最新实例过滤；`failure_categories` 独立分类
+  （network_timeout/auth_failed/permission/config/unknown），不归并
+  为额度耗尽。
+- `ClientDiagnostics.acp_reload_available/acp_reconnect_available`：
+  当前版本客户端实测只注册了 `*reloadAcpConnections`，无
+  `reconnectAcpConnections` 且无外部调用入口 → 界面仅给命令面板手动
+  指引，不模拟成功。
+
+**恢复流程/界面**（应用设置 → 客户端 →「模型列表诊断与恢复」）
+- 顺序：开始诊断（只读）→ ACP 重载手动指引 → 代理配置辅助（端口 +
+  用途确认复选框 + CONNECT 探测门）→ PAC 清除指引 → 重启（已保存工作
+  复选框门，温和关闭不强杀）。
+- 结果反馈状态机：任何恢复操作成功后进入「已发起恢复，等待确认」，由
+  「已显示且消息正常」/「仍未恢复」按钮记录用户确认结果；不凭端口/
+  写文件/进程启动声称已修复。
+- 导出前「预览报告」（`preview_diagnostics_report`，不落盘）；
+  `render_markdown_report` 全文过 `redact_text`，报告新增客户端环境
+  小节（路径字段用显示格式而非调试格式，避免 `\` 转义绕过用户目录
+  脱敏正则——已有回归测试）。
+
+**安全集成**
+- `apply_client_proxy_fix` / `revert_client_proxy_fix` /
+  `restart_devin_client` 均取 `CLIENT_LOCK` + `lock_client_operation`
+  + `ensure_no_in_flight_switch`：切号在途时恢复操作被阻断。
+- 诊断结果不接入轮换决策；超时/429/权限错误不触发切号。
+
+**测试**：184/0（新增 22 项覆盖 JSONC 编辑、备份/并发/回读/撤销冲突、
+PAC 解析、CONNECT 探测拒绝、失败分类、报告端到端脱敏含用户路径）。
+`cargo build --bin` 通过；`npm run build`、`test:quota`、`ui-smoke`
+（新增诊断段：只读扫描零写入、预览、确认门、应用→撤销、反馈状态机、
+重启已保存门）通过；`diff --check`（cr-at-eol）干净。
+
+**支持版本**：Devin Desktop 1.126.0 本机实测（ACP 命令注册表核对）。
+**未实测清单**：真实模型列表故障下的逐项恢复效果（需现场验收）；
+`devin.reconnectAcpConnections` 若未来版本注册需重新核查；TUN/多梯子
+叠加环境的完整覆盖。
+**文档**：`docs/Devin模型列表问题诊断报告.md` 已归档为调查材料（头部
+已标注，不作为已证实产品行为）。
+未提交、未推送、未发布。
+
+## 2026-10-17g — 撤销语义修正 + 持久化（二轮审查修复）
+
+- **撤销恢复原状而非删除**：`ProxyFixState` 新增 `previous_value`（写入
+  前原值）与 `settings_existed`（文件原本是否存在；旧记录字段缺失时
+  serde 默认退化为旧行为）。`revert_proxy_fix_to_settings` 分支处理：
+  有原值→写回原值；无原值→移除键；文件由本工具创建且只剩该键→删除
+  整个文件。其余设置（含用户写入后新增字段）经条件写保留；当前值被
+  改动仍拒绝自动恢复。回归测试覆盖 7890→7897→7890 全链路。
+- **状态记录先于配置写入**：`apply_proxy_fix_to_settings` 改为
+  备份→落盘撤销记录→条件写配置。记录写不进→中止不碰配置；配置写
+  失败→清理记录不留假凭据。消除"改了没法自动还原"的部分成功。
+- **撤销入口跨页面保留**：新增 `get_proxy_fix_state` 只读命令；前端
+  挂载时加载，存在记录即显示独立「撤销代理修改」块（与诊断结果/页面
+  无关），显示写入值、原值、时间与备份位置。修正"撤销成功即卸载块
+  导致结果消息不可见"的渲染 bug——结果消息挪到块外。
+- **反馈持久化并纳入报告**：`record_recovery_feedback` 命令把用户
+  「已显示且消息正常／仍未恢复」写入 `recovery-feedback.json`（留
+  50 条）；预览与导出报告追加「恢复结果反馈记录」小节（整体再过
+  脱敏）。落盘失败时界面明确"不计入报告"，不再虚假声称已记录。
+- 测试：191/0（新增 7 项：恢复原值/删回文件/保留用户键/apply-revert
+  全链路/状态写失败中止/写失败清记录/反馈落盘+报告小节）。
+  `npm run build`、ui-smoke（含原值恢复断言与反馈落盘计数）通过。
+
+## 2026-10-17h — 撤销链第三轮审查修复
+
+- **重复修复不再丢撤销凭据**：apply 在写配置前检查 `proxy-fix-state.json`
+  已存在即拒绝（"请先撤销本次修改"），内外两层同语义；失败清理因此
+  只会删本次刚创建的记录，不再误删上一次成功修改的还原凭据。
+- **旧记录原值从备份求证**：`revert_with_state`（抽出为可测单元）对缺
+  `previousValue` 的旧记录改为读取其登记的写入前备份——备份里有
+  http.proxy 就按它恢复，备份证明没有才移除键，备份不可读/非法则
+  拒绝自动恢复并给备份位置。"原值未知"不再被当成"原本没有代理"。
+- **原值脱敏后再上前端**：`mask_proxy_display` 隐去 userinfo
+  （user:pass@ → ***@）与查询参数；`get_proxy_fix_state` 只回脱敏
+  值，完整原值仅存在后端状态文件供恢复使用。界面在出现脱敏形态时
+  标注"含认证信息，脱敏显示"。
+- 测试：196/0（+5：存在未撤销记录拒绝/旧记录备份恢复原值/备份不可读
+  拒绝/空备份证实无原值/原值凭据脱敏）。npm build、ui-smoke、
+  diff --check 通过。
+- **撤销返回体同样脱敏**：`revert_with_state` 的成功消息改用
+  `mask_proxy_display(v)`——恢复动作仍用后端完整原值，但
+  `ProxyFixOutcome.new_proxy`（直接上前端）不再含 user:pass@/查询
+  参数。新增 `revert_outcome_masks_credentials_but_restores_full_value`
+  全链路断言：配置恢复完整原值、序列化返回体零密码。
+
+### 17i 本轮诊断界面与交互复核（2026-10-17）
+
+- 已核对撤销成功返回体调用 mask_proxy_display，真实原值仍仅用于后端恢复。
+- 诊断页新增异常/正常/未知三项概览，完善深浅主题、窄窗口换行和操作反馈。
+- 移除自动选择首个监听端口；未撤销修改期间前端禁止再次写入；诊断、代理操作、重启与反馈提交期间按钮互斥。
+- 反馈提交增加即时防重入，防止双击重复写入；新诊断清除旧预览，旧的初始化缓存不再覆盖正在进行的新诊断。
+- 更正诊断只读文案：会保存本机脱敏结果，不修改官方配置。
+- 本轮实跑：Rust 197 passed / 0 failed / 2 ignored；前端构建、额度测试、UI 冒烟、diff --check 通过。新增冒烟断言覆盖三态概览、不自动填端口和未撤销期间禁写。
+- 使用合成 IPC 检查浅色、深色及 720px 视口，无横向溢出。截图写临时目录，未覆盖仓库截图。
+- 真实模型故障恢复、官方退出后网页登录未实测；界面性能未做量化基准，不宣称网络诊断耗时降低。未提交、未推送。
+- 本轮 release 构建已成功（4m21s，16 条既有警告）；程序：src-tauri/target/release/devin-account-manager.exe。
+
+### 17j 正式版启动修正（2026-10-17）
+
+- 用户实测发现此前普通 cargo build --release 产物仍访问 devUrl，开发服务器关闭后报 localhost 拒绝连接。此前“release 构建通过”仅代表编译成功，不代表独立运行验收通过。
+- Cargo.toml 明确声明 custom-protocol feature；新增 npm run build:desktop（tauri build --no-bundle）作为独立客户端构建入口，由 Tauri CLI 启用生产资源协议并先构建前端。
+- 不将普通 cargo build --release 的无 custom-protocol 产物提供给用户；开发模式继续使用 Tauri dev。
+- tauri build --no-bundle 实跑通过；1420 端口无监听时已启动生产 exe（PID 40592）。页面显示效果仍需用户确认。
+
+### 17k 独立诊断入口、支持二维码与外链（2026-10-17）
+
+- README 重写为当前功能、快速开始、诊断步骤、使用支持、安全边界、正确构建方式及许可说明；新增 public/support 两张用户提供的原始二维码（哈希核对一致），关于页也展示。
+- 左侧新增「诊断与恢复」独立页面，移除客户端设置底部诊断块，切换页面时回到顶部。
+- ACP 卡片提供可选中文本、复制命令、打开 Devin、用户执行后的反馈入口。官方命令仍须在客户端命令面板执行，不宣称由管理器自动执行。无效 PAC 残留不再列入恢复操作区。
+- 新增固定目的地 open_project_link，由系统浏览器打开项目仓库/Issues/上游链接；前端失败时显示地址及错误。仓库实际 URL 与 origin 一致，HTTP HEAD 返回 200。关于页版本来自 package.json。
+- 打开诊断客户端命令使用客户端操作锁、进程间锁、在途门禁；复用已有启动能力，不修改官方扩展和认证数据，不强制新窗口、不重启。
+- 实跑 Rust 198 passed / 0 failed / 2 ignored；前端构建、额度测试、UI 冒烟通过。新增回归覆盖独立入口、剪贴板真实复制、打开客户端模拟调用、系统外链调用与失败提示、二维码加载、固定 URL 白名单。
+- 浅色 720px 诊断页与支持页截图人工检查，无横向溢出。真实模型故障恢复未在本轮复现；真实客户端打开命令与浏览器动作不以模拟冒烟代替验收。未提交、未推送。
+- 本轮 npm run build:desktop 成功，1420 无监听时已启动新生产 exe。
+
+### 17l 日志 ZIP 导出与显式彻底重启（2026-10-17）
+
+- 新增 client_support 模块，独立「导出 Devin 日志包」按钮，无需预先诊断。仅采集默认配置的 cli/logs 与 logs 下 .log/.txt/.jsonl，跳过符号链接和 Windows reparse point，限制深度/枚举量，按最新时间最多40文件，每文件末尾512KiB；记录截取及跳过数量。
+- 内容经现有脱敏器处理，并省略含常见结构化对话字段的日志行；不导出User设置、账号数据库或密钥。不能保证去掉所有项目/代码等私人内容，UI和包内README均要求分享前检查。ZIP和可检查文本目录保存在本机diagnostics/exports，未上传。
+- 使用Windows内置.NET ZIP能力，无新增依赖；路径通过环境变量传递，命令文本固定，无用户内容拼入shell。
+- 新增显式「导出日志并彻底重启」：必须确认未保存工作及终端/AI任务中断风险，先归档日志，失败则不结束进程；使用客户端锁、进程间锁和切号在途门禁。只处理核实安装路径的默认实例进程树、同安装目录的精确内置agent路径，多个配置无法区分时拒绝；身份变化或结束失败不继续启动。不清理认证文件、密钥、缓存或登录数据库。
+- 此强制流程独立于标准切号/温和重启，未接入自动轮换。强制终止本质有任务中断及未保存内容丢失风险，不宣称必能修复模型问题。
+- 按用户要求从软件关于页移除微信二维码，图片移至docs/assets/support，仅README引用；不再作为public资源随软件分发。保留上游许可署名。
+- 实跑全套Rust：203 passed / 0 failed / 3 ignored；前端构建、额度测试、UI冒烟通过。覆盖未确认零操作、日志导出错误可见、目录入口、强制操作失败反馈与确认重置、模拟成功、无软件二维码。
+- 显式本机只读导出测试通过：40日志/42归档条目，Python zipfile完整性检查通过；4类常见凭据模式扫描0匹配（非穷尽隐私证明）。原日志与官方配置未修改。实际强制结束/模型恢复尚未现场实测。
+- 本轮正式 Tauri 构建成功（3m11s）；1420无监听时已启动新exe，未执行真实强制重启。
+
+### 17m 账号/Token 文件导出（2026-10-17）
+
+- 新增账号页「导出 Token」快捷入口，直达设置数据管理；支持选择账号、全选、JSON完整账号迁移和TXT每行一个凭据。
+- JSON保留模型中的账号、Org ID、Auth1等刷新凭据；TXT优先长期Auth1，退回API/会话Token时提示短期风险，不保留组织信息，仅一次性ott$/oidc$时拒绝导出。缺失账号或异常Token不会静默跳过，不联网刷新。
+- 由Rust读取用户所选账号并直接写本机exports/credentials，使用UUID文件名及私有原子写入，不产生明文.bak；IPC仅返回路径/格式/数量/短期计数。前端不接收Token原文，不写日志或上传。
+- 导出必须显式勾选明文凭据保管提示；改选账号或格式后重新确认，防重入，导出后可打开目录。JSON/TXT文件为用户主动生成的明文敏感文件，不应放入日志包或公开仓库。
+- 实跑Rust 207 passed / 0 failed / 3 ignored，含4项新增导出回归（组织及凭据保留、返回体无秘密、一次性凭据拒绝、短期计数、无确认拒绝）。前端构建、额度测试通过。
+- 未导出真实用户账号，仅使用合成账号验证；真实在线凭据有效性和异机重新授权不以离线文件测试代替。
+- UI冒烟通过，覆盖账号页快捷入口、未确认禁用、错误可见、JSON/TXT导出、目录打开、格式变更重新确认与720px无横向溢出。
+- 正式Tauri构建完成（3m07s），开发服务器关闭时已启动新版客户端；未提交未推送。

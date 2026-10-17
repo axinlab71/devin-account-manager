@@ -13,6 +13,13 @@ const path = require('node:path');
   const account = (id,name,email,plan,days) => ({id,github_name:name,github_login:email,github_email:email,github_id:0,credential_state:'unverified',last_switched_at:now-days*3600,copilot_plan:plan,created_at:now-days*86400,last_used:now-days*3600});
   window.uiFixture = { accounts:[{...account('demo-1','Alex Chen','alex@example.com','Pro',1),windsurf_plan_status:{planInfo:{monthlyPromptCredits:5000},availablePromptCredits:5000,usedPromptCredits:1200}}, {...account('demo-2','Design Studio','design@example.com','Teams',3),windsurf_plan_status:{billingStrategy:'quota',dailyQuotaRemainingPercent:75,weeklyQuotaRemainingPercent:40,dailyQuotaResetAtUnix:now+3600,weeklyQuotaResetAtUnix:now+86400}}, {...account('demo-3','Personal','personal@example.com','Free',5),quota_query_last_error:'synthetic expired',native_switch_credential_ready:false}],calls:[],legacyCount:2 };
   const mockRotationCfg = () => ({mode:'off',enabledPool:[],thresholdPercent:10,pollIntervalSecs:60,snapshotMaxAgeSecs:120,lowConfirmGapMs:5000,candidateMarginPoints:5,minSwitchIntervalSecs:600,cooldownSecs:1800,maxConsecutiveFailures:3,sortMode:'min_remaining_desc',priorities:{}});
+  const mockDiag = () => ({generatedAtMs:Date.now(),appVersion:'0.5.1',
+   items:[{id:'pac',group:'proxy',title:'PAC 自动配置脚本生效中且目标不可达',status:'confirmed_issue',detail:'PAC 生效但端口无监听',evidence:['flags=0x0F','pac=http://127.0.0.1:9/pac']},{id:'net',group:'network',title:'认证服务 TLS 正常',status:'ok',detail:'server.codeium.com 握手正常',evidence:[]}],
+   client:{exePath:'E:\\Devin\\Devin.exe',exeExists:true,productVersion:'1.126.0',productCommit:'abc',fileVersion:'1.126.0',dataDir:'C:\\synthetic',dataDirExists:true,userSettingsExists:true,cliLogDirExists:true,ideProcessesRunning:3,agentProcessesRunning:1,acpReloadAvailable:true,acpReconnectAvailable:false},
+   proxy:{systemProxyEnabled:false,systemProxyServer:null,systemProxyListening:null,pacConfigured:true,pacActive:true,pacTarget:'http://127.0.0.1:9/pac',pacListening:false,envProxies:[],devinSettingsProxy:null,devinAgentEnvKeys:[],confirmedProxyIssue:true,stalePacConfirmed:false,ineffectiveProxyConfirmed:false,listeningLocalPorts:[7897]},
+   network:[{host:'server.codeium.com',dnsOk:true,resolvedIp:'104.18.0.1',tcp:{attempts:2,successes:2,minMs:10,maxMs:20},tls:{attempts:2,successes:2,minMs:40,maxMs:60},classification:'healthy',path:'direct',riskNote:null}],
+   logs:{logDir:'C:\\synthetic\\logs',totalLogFiles:5,logsExamined:5,agentStarts:2,authenticateAttempts:2,authenticateWithCredentials:2,teamSettingsFailures:1,timeoutFailures:0,zdrTimeouts:0,remoteConfigFailures:0,lastFailureAt:'2026-10-17 10:00',agentVersions:['1.126'],runningAgentPids:[1234],runningAgentsAuthenticated:false,newestLogHasAuthFailure:true,failureCategories:['auth_failed']},
+   summary:{category:'代理配置问题',confidence:'高',overview:'合成：PAC 生效且目标不可达',recommendedFixes:[{id:'clear_stale_pac_config',label:'查看 PAC 清除指引',requiresRestart:false,affectsLogin:false,manual:true},{id:'reload_acp_connections',label:'重新加载 ACP 连接',requiresRestart:false,affectsLogin:false,manual:true},{id:'apply_client_proxy_fix',label:'写入客户端代理设置',requiresRestart:false,affectsLogin:false,manual:false},{id:'restart_devin_client',label:'重启官方客户端',requiresRestart:true,affectsLogin:false,manual:false}]}});
   window.__TAURI_INTERNALS__ = { invoke: async (cmd,args) => {
    const f=window.uiFixture; f.calls.push(cmd);
    if(cmd==='list_windsurf_accounts') {if(sessionStorage.getItem('failList')) throw new Error('synthetic storage error');return [...f.accounts];}
@@ -41,6 +48,23 @@ const path = require('node:path');
     return f.nativeVerifySuccess ? {state:'verified',sessionLabel:'Synthetic switched account',remoteStatus:'passed'} : {state:'pending'};
    }
    if(cmd==='dismiss_rotation'){if(f.rotation)f.rotation.lastDecision=undefined;sessionStorage.removeItem('manualAwaiting');return;}
+   if(cmd==='get_last_diagnostics')return f.lastDiag||null;
+   if(cmd==='run_connection_diagnostics'){f.lastDiag=mockDiag();return f.lastDiag;}
+   if(cmd==='preview_diagnostics_report')return '# 诊断报告预览（合成）\n- 代理异常：已确认\n- 敏感信息已脱敏\n';
+   if(cmd==='export_diagnostics_report')return 'C:\\synthetic\\diagnostics-report.md';
+   if(cmd==='get_proxy_fix_state')return f.fixState||null;
+   if(cmd==='apply_client_proxy_fix'){if(sessionStorage.getItem('failProxyFix'))throw new Error('Synthetic proxy handshake refused');f.fixState={writtenValue:'http://127.0.0.1:'+args.port,previousValue:'http://127.0.0.1:7890',writtenAtMs:Date.now(),settingsPath:'C:\\synthetic\\settings.json',backupPath:'C:\\synthetic\\backup.json'};return {settingsPath:'C:\\synthetic\\settings.json',newProxy:'http://127.0.0.1:'+args.port,backupPath:'C:\\synthetic\\backup.json',legacyNestedProxyPresent:false,writeVerified:true,statePath:'C:\\synthetic\\proxy-fix-state.json'};}
+   if(cmd==='revert_client_proxy_fix'){if(!f.fixState)throw new Error('没有本工具写入的代理修改记录');const prev=f.fixState.previousValue;f.fixState=null;return {settingsPath:'C:\\synthetic\\settings.json',newProxy:prev?'已恢复为 '+prev:'(已移除)',backupPath:'C:\\synthetic\\backup.json',legacyNestedProxyPresent:false,writeVerified:true,statePath:''};}
+   if(cmd==='record_recovery_feedback'){f.calls.push('feedback:'+args.verdict);return;}
+   if(cmd==='clear_stale_pac_config')return {performed:false,applicable:true,steps:['Win+R 运行 inetcpl.cpl','连接 → 局域网设置','取消勾选「使用自动配置脚本」'],note:'本工具不修改注册表'};
+   if(cmd==='export_account_credentials'){if(!args.confirmed)throw new Error('confirmation required');if(sessionStorage.getItem('failCredentialExport'))throw new Error('Synthetic export failure');f.calls.push('credential-export:'+args.format+':'+args.accountIds.length);return {path:'C:/synthetic/credentials.'+args.format,count:args.accountIds.length,format:args.format,shortLivedCount:args.format==='txt'?1:0};}
+   if(cmd==='open_account_exports_folder'){f.calls.push('credential-folder-open');return;}
+   if(cmd==='export_devin_logs'){if(sessionStorage.getItem('failLogExport'))throw new Error('Synthetic log export failed');return {archivePath:'C:/synthetic/logs.zip',folderPath:'C:/synthetic/logs',files:4,truncatedFiles:1,skippedFiles:2};}
+   if(cmd==='open_log_export_folder'){f.calls.push('log-folder-open');return;}
+   if(cmd==='complete_restart_devin'){if(!args.confirmed)throw new Error('confirmation required');f.calls.push('forced-restart-confirmed');if(sessionStorage.getItem('failForceRestart'))throw new Error('Synthetic multi-profile refusal');return {message:'已完成进程彻底重启，请核对模型',terminatedProcesses:3,logExport:{archivePath:'C:/synthetic/pre-restart.zip',folderPath:'C:/synthetic/pre-restart',files:3,truncatedFiles:0,skippedFiles:0}};}
+   if(cmd==='open_client_for_diagnostics'){f.calls.push('diagnostic-client-open');return;}
+   if(cmd==='open_project_link'){f.calls.push('project-link:'+args.destination);if(sessionStorage.getItem('failProjectLink'))throw new Error('Synthetic browser unavailable');return;}
+   if(cmd==='restart_devin_client')return '客户端已正常关闭并重新启动，agent 子进程将重新认证。';
    throw new Error('Unexpected mock command: '+cmd);
   }};
  });
@@ -165,14 +189,112 @@ await page.getByText('当前：尝试免重启（实验性）',{exact:false}).wa
 assert.equal(await page.evaluate(()=>localStorage.getItem('devin.switchMethod')),'native');
 await methodSel.selectOption('standard');
  await page.getByRole('textbox',{name:'客户端程序完整路径'}).fill('E:\\Devin\\Devin.exe');await page.getByRole('button',{name:'保存路径',exact:true}).click();await page.getByText('客户端路径已保存。',{exact:true}).waitFor();await page.getByRole('button',{name:'关闭提示',exact:true}).click();await page.screenshot({path:'docs/ui-0.4.0-settings-client.png',fullPage:true});
+ await page.locator('.sidebar .nav-item').first().click();
+ await page.getByRole('button',{name:'导出 Token',exact:true}).click();
+ await page.getByRole('heading',{name:'导出账号与 Token',exact:true}).waitFor();
+ await page.getByRole('button',{name:'应用设置',exact:true}).click();
+ await page.getByRole('tab',{name:'客户端',exact:true}).click();
+ // Diagnostics has its own sidebar page, not the bottom of client settings.
+ assert.equal(await page.getByRole('heading',{name:'模型列表诊断与恢复',exact:true}).count(),0);
+ await page.getByRole('button',{name:'诊断与恢复',exact:true}).click();
+ await page.getByRole('heading',{name:'诊断与恢复',exact:true}).waitFor();
+ const forceButton=page.getByRole('button',{name:'导出日志并彻底重启',exact:true});
+ assert.equal(await forceButton.isDisabled(),true);
+ assert.equal(await page.evaluate(()=>window.uiFixture.calls.filter(c=>c==='forced-restart-confirmed').length),0);
+ await page.evaluate(()=>sessionStorage.setItem('failLogExport','true'));
+ await page.getByRole('button',{name:'导出 Devin 日志包',exact:true}).click();
+ await page.getByText(/Synthetic log export failed/).waitFor();
+ await page.evaluate(()=>sessionStorage.removeItem('failLogExport'));
+ await page.getByRole('button',{name:'导出 Devin 日志包',exact:true}).click();
+ await page.getByText('C:/synthetic/logs.zip',{exact:true}).waitFor();
+ await page.getByRole('button',{name:'打开日志目录',exact:true}).click();
+ assert.ok(await page.evaluate(()=>window.uiFixture.calls.includes('log-folder-open')));
+ await page.getByText('我已保存工作，确认允许强制结束进程及中断终端、AI 任务',{exact:true}).click();
+ await page.evaluate(()=>sessionStorage.setItem('failForceRestart','true'));
+ await forceButton.click();await page.getByText(/Synthetic multi-profile refusal/).waitFor();
+ assert.equal(await forceButton.isDisabled(),true);
+ await page.evaluate(()=>sessionStorage.removeItem('failForceRestart'));
+ await page.getByText('我已保存工作，确认允许强制结束进程及中断终端、AI 任务',{exact:true}).click();
+ await forceButton.click();await page.getByText(/已完成进程彻底重启，请核对模型/).waitFor();
+ assert.equal(await forceButton.isDisabled(),true);
+ // Diagnostics & recovery: read-only scan, preview, confirm gates, verdict feedback.
+ await page.getByRole('button',{name:'开始诊断',exact:true}).click();
+ await page.getByText('已确认异常（1 项）',{exact:true}).waitFor();
+ assert.equal(await page.locator('.diag-metric').count(),3);
+ assert.equal(await page.getByRole('textbox',{name:'本机代理端口'}).inputValue(),'');
+ assert.equal(await page.evaluate(()=>window.uiFixture.calls.filter(c=>['apply_client_proxy_fix','restart_devin_client','revert_client_proxy_fix'].includes(c)).length),0);
+ await page.getByRole('button',{name:'预览报告',exact:true}).click();
+ await page.locator('.diag-preview').waitFor();assert.match(await page.locator('.diag-preview').innerText(),/诊断报告预览/);
+ assert.equal(await page.getByRole('textbox',{name:'ACP 重载命令'}).inputValue(),'Reload ACP Connections');
+ await page.context().grantPermissions(['clipboard-read','clipboard-write'],{origin:'http://127.0.0.1:1420'});
+ await page.getByRole('button',{name:'复制命令',exact:true}).click();
+ await page.getByText(/命令已复制/).waitFor();
+ assert.equal(await page.evaluate(()=>navigator.clipboard.readText()),'Reload ACP Connections');
+ await page.getByRole('button',{name:'打开 Devin',exact:true}).click();
+ await page.getByText(/已请求打开 Devin/).waitFor();
+ assert.ok(await page.evaluate(()=>window.uiFixture.calls.includes('diagnostic-client-open')));
+ assert.equal(await page.getByText('PAC 自动配置脚本',{exact:true}).count(),1);
+ const applyBtn=page.getByRole('button',{name:'写入客户端代理设置',exact:true});
+ await applyBtn.waitFor();assert.equal(await applyBtn.isDisabled(),true);
+ await page.getByRole('textbox',{name:'本机代理端口'}).fill('7897');
+ assert.equal(await applyBtn.isDisabled(),true);
+ await page.getByText('我确认该端口是本机代理软件的实际代理端口').click();
+ await page.evaluate(()=>sessionStorage.setItem('failProxyFix','true'));
+ await applyBtn.click();await page.getByText('Error: Synthetic proxy handshake refused',{exact:true}).waitFor();
+ await page.evaluate(()=>sessionStorage.removeItem('failProxyFix'));
+ await applyBtn.click();await page.getByText(/已写入 http:\/\/127\.0\.0\.1:7897/).waitFor();
+ const revertBtn=page.getByRole('button',{name:'撤销本次修改',exact:true});await revertBtn.waitFor();
+ assert.equal(await applyBtn.isDisabled(),true,'未撤销修改期间不能重复写入代理');
+ // Revert restores the original value recorded in persisted state, not a bare delete.
+ await page.getByText(/撤销将恢复原值 http:\/\/127\.0\.0\.1:7890/).waitFor();
+ await page.getByRole('button',{name:'已显示且消息正常',exact:true}).waitFor();
+ await revertBtn.click();await page.getByText(/已撤销本次修改：http\.proxy 已恢复为 http:\/\/127\.0\.0\.1:7890/).waitFor();
+ await page.getByRole('button',{name:'仍未恢复',exact:true}).click();await page.getByText(/本次恢复未解决问题/).waitFor();
+ const restartBtn=page.getByRole('button',{name:'重启官方客户端',exact:true});
+ assert.equal(await restartBtn.isDisabled(),true);
+ await page.getByText('我已保存工作',{exact:true}).click();assert.equal(await restartBtn.isDisabled(),false);
+ await restartBtn.click();await page.getByText(/agent 子进程将重新认证/).waitFor();
+ await page.getByRole('button',{name:'已显示且消息正常',exact:true}).click();await page.getByText(/用户确认模型列表恢复/).waitFor();
+ assert.ok(await page.evaluate(()=>window.uiFixture.calls.filter(c=>c==='feedback:confirmed'||c==='feedback:unresolved').length>=2));
+ await page.getByRole('button',{name:'应用设置',exact:true}).click();
  await page.getByRole('tab',{name:'数据管理',exact:true}).click();await page.getByText('Synthetic UI fixture',{exact:true}).waitFor();await page.screenshot({path:'docs/ui-0.4.0-settings-data.png',fullPage:true});
+ // Explicit credential export writes a file; IPC/UI never receives token text.
+ const exportFileButton=page.getByRole('button',{name:'确认导出文件',exact:true});
+ assert.equal(await exportFileButton.isDisabled(),true);
+ const exportCalls=await page.evaluate(()=>window.uiFixture.calls.filter(c=>c==='export_account_credentials').length);
+ await page.getByRole('button',{name:'全选账号',exact:true}).click();
+ assert.equal(await exportFileButton.isDisabled(),true);
+ await page.getByText('我了解导出文件含明文登录凭据，只用于本人授权账号的备份或迁移，并会妥善保管',{exact:true}).click();
+ await page.evaluate(()=>sessionStorage.setItem('failCredentialExport','true'));
+ await exportFileButton.click();await page.getByText(/Synthetic export failure/).waitFor();
+ assert.equal(await exportFileButton.isDisabled(),true);
+ await page.evaluate(()=>sessionStorage.removeItem('failCredentialExport'));
+ await page.getByText('我了解导出文件含明文登录凭据，只用于本人授权账号的备份或迁移，并会妥善保管',{exact:true}).click();
+ await exportFileButton.click();await page.getByText('C:/synthetic/credentials.json',{exact:true}).waitFor();
+ await page.getByRole('button',{name:'打开账号导出目录',exact:true}).click();
+ assert.ok(await page.evaluate(()=>window.uiFixture.calls.includes('credential-folder-open')));
+ await page.getByLabel('文件格式',{exact:true}).selectOption('txt');
+ assert.equal(await exportFileButton.isDisabled(),true);
+ await page.getByText('我了解导出文件含明文登录凭据，只用于本人授权账号的备份或迁移，并会妥善保管',{exact:true}).click();
+ await exportFileButton.click();await page.getByText('C:/synthetic/credentials.txt',{exact:true}).waitFor();
+ assert.equal(await page.evaluate(()=>window.uiFixture.calls.filter(c=>c==='export_account_credentials').length),exportCalls+3);
+ await page.setViewportSize({width:720,height:900});
+ assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+ await page.setViewportSize({width:1120,height:780});
  const restoresBefore=await page.evaluate(()=>window.uiFixture.calls.filter(c=>c==='restore_last_client_state').length);
  await page.getByRole('button',{name:'恢复上次状态',exact:true}).click();await page.getByRole('dialog').getByRole('button',{name:'取消',exact:true}).click();assert.equal(await page.evaluate(()=>window.uiFixture.calls.filter(c=>c==='restore_last_client_state').length),restoresBefore);
  await page.evaluate(()=>sessionStorage.setItem('failRestore','true'));await page.getByRole('button',{name:'恢复上次状态',exact:true}).click();await page.getByRole('button',{name:'确认恢复',exact:true}).click();await page.getByRole('dialog').getByText('Error: Synthetic restore refused before writes',{exact:true}).waitFor();await page.keyboard.press('Escape');await page.evaluate(()=>sessionStorage.removeItem('failRestore'));
  await page.getByRole('button',{name:'恢复上次状态',exact:true}).click();await page.getByRole('button',{name:'确认恢复',exact:true}).click();await page.getByRole('dialog').waitFor({state:'hidden'});await page.getByRole('button',{name:'关闭提示',exact:true}).click();
  await page.getByRole('button',{name:'清理旧版备份',exact:true}).click();await page.getByRole('button',{name:'确认清理',exact:true}).click();await page.getByRole('dialog').waitFor({state:'hidden'});assert.equal(await page.getByRole('button',{name:'清理旧版备份',exact:true}).isDisabled(),true);await page.getByRole('button',{name:'关闭提示',exact:true}).click();
  await page.getByRole('button',{name:'导入账号',exact:true}).click();await page.getByRole('tab',{name:'本地迁移',exact:true}).waitFor();await page.keyboard.press('Escape');
- await page.getByRole('tab',{name:'关于',exact:true}).click();await page.getByText('v0.4.0',{exact:true}).waitFor();assert.equal(await page.getByRole('link',{name:/开源仓库/}).getAttribute('href'),'https://github.com/axinlab71/devin-account-manager');await page.screenshot({path:'docs/ui-0.4.0-about.png',fullPage:true});
+ await page.getByRole('tab',{name:'关于',exact:true}).click();await page.getByText('v0.5.1',{exact:true}).waitFor();assert.equal(await page.getByRole('link',{name:/开源仓库/}).getAttribute('href'),'https://github.com/axinlab71/devin-account-manager');await page.screenshot({path:'docs/ui-0.4.0-about.png',fullPage:true});
+ await page.getByRole('link',{name:/开源仓库/}).click();
+ assert.ok(await page.evaluate(()=>window.uiFixture.calls.includes('project-link:repository')));
+ await page.evaluate(()=>sessionStorage.setItem('failProjectLink','true'));
+ await page.getByRole('link',{name:/意见反馈/}).click();
+ await page.getByText(/Synthetic browser unavailable/).waitFor();
+ await page.evaluate(()=>sessionStorage.removeItem('failProjectLink'));
+ assert.equal(await page.locator('img[src*="support/"]').count(),0,'二维码仅在 README 展示');
  // Rotation tab: status line, pool layout with 全选/清空, dirty-scan hint, concise save feedback.
  await page.getByRole('tab',{name:'额度轮换',exact:true}).click();await page.getByText('额度监控',{exact:true}).waitFor();
  await page.getByText(/已关闭|运行中|已暂停/).waitFor();
@@ -299,7 +421,7 @@ await methodSel.selectOption('standard');
 
  await page.evaluate(()=>sessionStorage.setItem('pendingSwitch','true'));await page.reload();await page.getByRole('button',{name:'查看恢复操作',exact:true}).waitFor();await page.getByRole('button',{name:'查看恢复操作',exact:true}).click();await page.getByRole('dialog').getByRole('button',{name:'取消',exact:true}).click();
  assert.deepEqual(errors,[]);
- console.log('PASS: safe-view fixtures without credentials; recovery confirmation/cancel/failure/success; legacy cleanup; pending-switch notice; OAuth progress; rotation tab + scan → recommendation banner + gated confirm + dismiss;  three-column card dimensions + six-account/two-row layout + 1000px two-column + 720px single-column; settings is a page with bottom navigation; four settings tabs + keyboard navigation; path save; reduced motion and privacy switches; settings migration entry; 3 synthetic accounts; current-first; search; filters; privacy; grid/list; theme + preference persistence; auth waiting/cancel; Token/JSON tabs; Escape; partial refresh; delete cancel/confirm; 720px responsive; quota percentages + credits + missing data; no overview banners; client status in settings; success toast auto-dismiss; stale quota labeling; bulk stop-after-current; client read failure preserves accounts; storage read failure + retry; zero browser exceptions.');
+ console.log('PASS: safe-view fixtures without credentials; recovery confirmation/cancel/failure/success; legacy cleanup; pending-switch notice; OAuth progress; rotation tab + scan → recommendation banner + gated confirm + dismiss;  three-column card dimensions + six-account/two-row layout + 1000px two-column + 720px single-column; settings is a page with bottom navigation; four settings tabs + keyboard navigation; path save; reduced motion and privacy switches; settings migration entry; 3 synthetic accounts; current-first; search; filters; privacy; grid/list; theme + preference persistence; auth waiting/cancel; Token/JSON tabs; Escape; partial refresh; delete cancel/confirm; 720px responsive; quota percentages + credits + missing data; no overview banners; client status in settings; success toast auto-dismiss; stale quota labeling; bulk stop-after-current; client read failure preserves accounts; storage read failure + retry; diagnostics read-only scan + report preview + gated proxy fix apply/revert + verdict feedback + restart saved-work gate; zero browser exceptions.');
  // A confirmed-low decision without candidates is visible, but cannot switch.
  await page.evaluate(async ()=>{
   const status=await window.__TAURI_INTERNALS__.invoke('get_rotation_status');

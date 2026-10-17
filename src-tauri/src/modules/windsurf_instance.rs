@@ -2383,3 +2383,106 @@ pub fn profile_is_running(profile: &Path) -> bool {
     )
     .is_empty()
 }
+
+/// Explicit support action only. Never called by switching or ordinary restart.
+#[cfg(target_os = "windows")]
+pub(crate) fn force_close_for_support(profile: &Path) -> Result<usize, String> {
+    let expected = fs::canonicalize(modules::config::get_user_config().windsurf_app_path)
+        .map_err(|_| "客户端路径无法核实，拒绝强制结束进程")?;
+    let install = expected.parent().ok_or("客户端安装路径无效")?;
+    let entries = collect_windsurf_process_entries();
+    let normalized = normalize_path_for_compare(&profile.to_string_lossy());
+    let targets = HashSet::from([normalized.clone()]);
+    let roots = select_windsurf_main_pids_by_target_dirs(&entries, &targets, Some(&normalized));
+    if entries.iter().any(|(pid, _)| !roots.contains(pid)) {
+        return Err("检测到其他配置的 Devin 实例，无法安全区分进程，请先手动关闭其他实例".into());
+    }
+    let mut system = System::new_all();
+    system.refresh_all();
+    for pid in &roots {
+        let exe = system.process(sysinfo::Pid::from_u32(*pid)).and_then(|p| p.exe());
+        if exe.and_then(|p| fs::canonicalize(p).ok()).as_ref() != Some(&expected) {
+            return Err("进程路径发生变化或无法核实，拒绝强制结束".into());
+        }
+    }
+    let parents: Vec<_> = system.processes().iter().map(|(pid, p)| (pid.as_u32(), p.parent().map(|id| id.as_u32()))).collect();
+    let mut selected = support_process_tree(&roots, &parents);
+    // Orphaned bundled agents are the common difference from a gentle restart.
+    for (pid, process) in system.processes() {
+        if let Some(exe) = process.exe().and_then(|p| fs::canonicalize(p).ok()) {
+            if exe.starts_with(install) && is_bundled_support_agent(&exe) {
+                selected.insert(pid.as_u32());
+            }
+        }
+    }
+    if selected.contains(&std::process::id()) {
+        return Err("进程范围包含管理器自身，已中止".into());
+    }
+    let mut identities: Vec<_> = selected.iter().filter_map(|id| {
+        system.process(sysinfo::Pid::from_u32(*id)).map(|p| (*id, p.start_time(), p.exe().map(Path::to_path_buf)))
+    }).collect();
+    identities.sort_by_key(|(id, _, _)| (!roots.contains(id), *id));
+    for (id, started, exe) in &identities {
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(*id)]), true);
+        if let Some(process) = system.process(sysinfo::Pid::from_u32(*id)) {
+            if process.start_time() != *started || process.exe().map(Path::to_path_buf) != *exe {
+                return Err("进程身份已变化，已停止后续操作；部分进程可能已结束，请手动检查".into());
+            }
+            if !process.kill() {
+                return Err("无法结束部分客户端进程（可能权限不足），未重新启动，请手动检查".into());
+            }
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let remaining = identities.iter().any(|(id, started, _)| {
+            system.process(sysinfo::Pid::from_u32(*id)).map(|p| p.start_time() == *started).unwrap_or(false)
+        });
+        let agent_remaining = system.processes().values().any(|p| {
+            p.exe().and_then(|p| fs::canonicalize(p).ok())
+                .map(|p| p.starts_with(install) && is_bundled_support_agent(&p)).unwrap_or(false)
+        });
+        if !remaining && !agent_remaining { break; }
+        if std::time::Instant::now() >= deadline {
+            return Err("仍有客户端或 agent 进程未退出，未重新启动，请手动检查".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    if profile_is_running(profile) {
+        return Err("客户端在操作中被重新启动，已停止，避免重复启动".into());
+    }
+    Ok(identities.len())
+}
+
+fn is_bundled_support_agent(path: &Path) -> bool {
+    path.to_string_lossy().replace('\\', "/").to_ascii_lowercase()
+        .ends_with("/resources/app/extensions/windsurf/devin/bin/devin.exe")
+}
+
+fn support_process_tree(roots: &[u32], parents: &[(u32, Option<u32>)]) -> HashSet<u32> {
+    let mut selected: HashSet<_> = roots.iter().copied().collect();
+    loop {
+        let before = selected.len();
+        for (pid, parent) in parents {
+            if parent.map(|p| selected.contains(&p)).unwrap_or(false) { selected.insert(*pid); }
+        }
+        if selected.len() == before { return selected; }
+    }
+}
+
+#[cfg(test)]
+mod support_process_tests {
+    #[test]
+    fn process_tree_never_selects_unrelated_roots_or_their_children() {
+        let edges = [(1,None),(2,Some(1)),(3,Some(2)),(90,None),(91,Some(90))];
+        assert_eq!(super::support_process_tree(&[1], &edges), std::collections::HashSet::from([1,2,3]));
+        assert!(super::support_process_tree(&[], &edges).is_empty());
+    }
+    #[test]
+    fn orphan_agent_match_is_exact_not_just_a_process_name() {
+        assert!(super::is_bundled_support_agent(std::path::Path::new("E:/Devin/resources/app/extensions/windsurf/devin/bin/devin.exe")));
+        assert!(!super::is_bundled_support_agent(std::path::Path::new("C:/Other/devin.exe")));
+        assert!(!super::is_bundled_support_agent(std::path::Path::new("E:/Devin/Devin.exe")));
+    }
+}

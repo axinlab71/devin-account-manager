@@ -209,6 +209,9 @@ pub struct ClientDiagnostics {
     pub cli_log_dir_exists: bool,
     pub ide_processes_running: usize,
     pub agent_processes_running: usize,
+    /// 客户端注册的 `*reloadAcpConnections` 命令（本版实测无 reconnect 命令）
+    pub acp_reload_available: bool,
+    pub acp_reconnect_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,7 +220,10 @@ pub struct ProxySection {
     pub system_proxy_enabled: bool,
     pub system_proxy_server: Option<String>,
     pub system_proxy_listening: Option<bool>,
-    pub pac_detected: bool,
+    /// blob 中存在 PAC URL 字符串（含未启用的残留）
+    pub pac_configured: bool,
+    /// 代理模式当前正启用 PAC（flags 含 PROXY_TYPE_AUTO_PROXY_URL 0x04）
+    pub pac_active: bool,
     pub pac_target: Option<String>,
     pub pac_listening: Option<bool>,
     pub env_proxies: Vec<String>,
@@ -247,6 +253,8 @@ pub struct NetworkProbeResult {
     pub tcp: Option<ProbeTiming>,
     pub tls: Option<ProbeTiming>,
     pub classification: String,
+    /// 探测路径：direct=管理器直连（不代表 Devin 实际走路径）/ proxy / unknown
+    pub path: String,
     pub risk_note: Option<String>,
 }
 
@@ -268,6 +276,9 @@ pub struct LogDiagnostics {
     pub running_agent_pids: Vec<u32>,
     pub running_agents_authenticated: Option<bool>,
     pub newest_log_has_auth_failure: bool,
+    /// 近期日志中出现的失败类别（不互相归并）：network_timeout /
+    /// auth_failed / permission / config / unknown
+    pub failure_categories: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -423,6 +434,45 @@ fn devin_settings_path(profile: &Path) -> PathBuf {
 // A. 客户端环境
 // ---------------------------------------------------------------------------
 
+/// 只读检测：当前客户端扩展注册的 ACP 恢复命令。
+/// 读 `resources/app/extensions/windsurf/package.json` 的
+/// `contributes.commands`；没有外部调用入口，仅用于决定是否提供
+/// 命令面板手动指引。（1.126.0 实测：reload 存在，reconnect 不存在）
+fn detect_acp_commands(exe_path: Option<&str>) -> (bool, bool) {
+    let Some(pkg) = exe_path
+        .map(|p| Path::new(p).parent().map(|b| b.to_path_buf()))
+        .flatten()
+        .map(|base| base.join("resources/app/extensions/windsurf/package.json"))
+        .filter(|p| p.is_file())
+    else {
+        return (false, false);
+    };
+    let Ok(text) = std::fs::read_to_string(&pkg) else {
+        return (false, false);
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return (false, false);
+    };
+    let mut reload = false;
+    let mut reconnect = false;
+    if let Some(commands) = value
+        .get("contributes")
+        .and_then(|c| c.get("commands"))
+        .and_then(|c| c.as_array())
+    {
+        for cmd in commands {
+            let id = cmd.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            if id.ends_with("reloadAcpConnections") {
+                reload = true;
+            }
+            if id.ends_with("reconnectAcpConnections") {
+                reconnect = true;
+            }
+        }
+    }
+    (reload, reconnect)
+}
+
 fn collect_client_info() -> (ClientDiagnostics, Vec<DiagnosticItem>) {
     let mut items = Vec::new();
     let app_path = client::detect_and_save_windsurf_launch_path(false);
@@ -476,6 +526,8 @@ fn collect_client_info() -> (ClientDiagnostics, Vec<DiagnosticItem>) {
         .unwrap_or(false);
 
     let (ide_count, agent_count) = count_client_processes();
+    let (acp_reload_available, acp_reconnect_available) =
+        detect_acp_commands(app_path.as_deref());
 
     let info = ClientDiagnostics {
         exe_path: app_path.clone().map(|p| redact_text(&p)),
@@ -489,6 +541,8 @@ fn collect_client_info() -> (ClientDiagnostics, Vec<DiagnosticItem>) {
         cli_log_dir_exists,
         ide_processes_running: ide_count,
         agent_processes_running: agent_count,
+        acp_reload_available,
+        acp_reconnect_available,
     };
 
     items.push(if exe_exists {
@@ -662,7 +716,8 @@ fn count_client_processes() -> (usize, usize) {
 struct RegistryProxyInfo {
     proxy_enable: Option<bool>,
     proxy_server: Option<String>,
-    pac_detected: bool,
+    pac_configured: bool,
+    pac_active: bool,
     pac_target: Option<(String, u16)>,
     pac_hidden_query: bool,
     read_error: Option<String>,
@@ -693,7 +748,8 @@ fn read_windows_proxy_registry() -> RegistryProxyInfo {
     if let Ok(connections) = settings.open_subkey_with_flags("Connections", winreg::enums::KEY_READ) {
         if let Ok(raw) = connections.get_raw_value("DefaultConnectionSettings") {
             if let Some(parsed) = parse_default_connection_settings(&raw.bytes) {
-                info.pac_detected = parsed.pac_detected;
+                info.pac_configured = parsed.pac_configured;
+                info.pac_active = parsed.pac_active;
                 info.pac_target = parsed.pac_target;
                 info.pac_hidden_query = parsed.pac_hidden_query;
             }
@@ -712,18 +768,25 @@ fn read_windows_proxy_registry() -> RegistryProxyInfo {
 
 #[derive(Debug, Clone)]
 pub struct ConnectionSettingsInfo {
-    pub pac_detected: bool,
+    /// blob 尾部存在 PAC URL 字符串（无论当前是否启用）
+    pub pac_configured: bool,
+    /// options 标志含 0x04（PROXY_TYPE_AUTO_PROXY_URL），PAC 正生效中
+    pub pac_active: bool,
     pub pac_target: Option<(String, u16)>,
     pub pac_hidden_query: bool,
 }
 
 /// 解析 `HKCU\...\Internet Settings\Connections\DefaultConnectionSettings`
-/// 注册表字节。只提取“是否配置了 PAC + PAC 目标主机:端口”，
+/// 注册表字节。只提取“是否配置了/启用了 PAC + PAC 目标主机:端口”，
 /// PAC URL 的 path/query/secret 绝不进入返回值。
 ///
 /// 字节布局（版本 0x3C/0x46）：version(4) counter(4) options(4)
 /// proxyServer(str+null) bypass(str+null) pacUrl(str+null) ...
 /// 注意 PAC URL 在 bypass 之后；旧实现漏掉 bypass，把 bypass 误当 PAC。
+///
+/// WinInet PROXY_TYPE 标志：0x01=DIRECT、0x02=手动代理(PROXY_TYPE_PROXY)、
+/// 0x04=PAC 自动配置(PROXY_TYPE_AUTO_PROXY_URL)、0x08=自动检测。
+/// blob 尾部残留 PAC URL 字符串不代表 PAC 生效——只有 flags 含 0x04 才算。
 pub fn parse_default_connection_settings(data: &[u8]) -> Option<ConnectionSettingsInfo> {
     if data.len() < 12 {
         return None;
@@ -734,7 +797,7 @@ pub fn parse_default_connection_settings(data: &[u8]) -> Option<ConnectionSettin
         return None;
     }
     let flags = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-    let pac_flag = flags & 0x02 != 0;
+    let pac_active = flags & 0x04 != 0;
     let mut offset = 12usize;
 
     let read_len = |offset: usize| -> Option<usize> {
@@ -750,7 +813,7 @@ pub fn parse_default_connection_settings(data: &[u8]) -> Option<ConnectionSettin
     };
 
     // 跳过一根长度前缀的字符串（proxyServer / bypass），内容不进入结果
-    let mut skip_string = |offset: &mut usize| -> Option<()> {
+    let skip_string = |offset: &mut usize| -> Option<()> {
         let len = read_len(*offset)?;
         *offset += 4;
         if len > data.len().saturating_sub(*offset) {
@@ -776,12 +839,13 @@ pub fn parse_default_connection_settings(data: &[u8]) -> Option<ConnectionSettin
     let pac_text = pac_text.trim_end_matches('\0').trim();
 
     let mut info = ConnectionSettingsInfo {
-        pac_detected: pac_flag,
+        pac_configured: false,
+        pac_active,
         pac_target: None,
         pac_hidden_query: false,
     };
     if !pac_text.is_empty() {
-        info.pac_detected = true;
+        info.pac_configured = true;
         if let Ok(url) = url::Url::parse(pac_text) {
             if let Some(host) = url.host_str() {
                 let port = url.port().unwrap_or(80);
@@ -809,9 +873,368 @@ fn collect_env_proxies() -> Vec<String> {
     out
 }
 
+/// 保守的 JSONC 预处理：去掉 `//` 与 `/* */` 注释、去掉对象/数组尾逗号。
+/// 字符串字面量（含转义）内的内容原样保留，URL 中的 `//` 不受影响；
+/// 不做任何其他规范化。settings.json 合法地包含注释和尾逗号（VS Code JSONC）。
+fn strip_jsonc(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string {
+            out.push(c);
+            if c == '\\' {
+                if let Some(escaped) = chars.next() {
+                    out.push(escaped);
+                }
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                out.push(c);
+            }
+            '/' => match chars.peek() {
+                Some('/') => {
+                    // 行注释：吃到换行为止
+                    for n in chars.by_ref() {
+                        if n == '\n' {
+                            out.push('\n');
+                            break;
+                        }
+                    }
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut prev = '\0';
+                    for n in chars.by_ref() {
+                        if prev == '*' && n == '/' {
+                            break;
+                        }
+                        prev = n;
+                    }
+                }
+                _ => out.push(c),
+            },
+            ',' => {
+                // 尾逗号：跳过空白后紧跟 } 或 ] 则丢弃该逗号
+                let mut pending_ws = Vec::new();
+                let mut trailing = false;
+                while let Some(&n) = chars.peek() {
+                    if n.is_whitespace() {
+                        pending_ws.push(chars.next().expect("peeked"));
+                    } else if n == '}' || n == ']' {
+                        trailing = true;
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                if !trailing {
+                    out.push(',');
+                }
+                for w in pending_ws {
+                    out.push(w);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// 解析 settings.json 文本（容忍 JSONC 注释与尾逗号）；失败返回 None。
+fn parse_settings_jsonc(content: &str) -> Option<serde_json::Value> {
+    if content.trim().is_empty() {
+        return Some(serde_json::json!({}));
+    }
+    serde_json::from_str(&strip_jsonc(content)).ok()
+}
+
+// ---------------------------------------------------------------------------
+// JSONC 局部编辑：只改顶层指定键，注释 / 其他字段 / 原始格式逐字节保留。
+// ---------------------------------------------------------------------------
+
+/// 顶层成员在原文中的位置（含相邻逗号，供删除用）。
+#[derive(Debug, Clone)]
+struct JsoncMember {
+    key: String,
+    key_start: usize,
+    value_end: usize,
+    /// 成员前面的 `,`（位于前一个成员与本成员之间）。
+    comma_before: Option<usize>,
+    /// 成员后面的 `,`（位于本成员与后一个成员之间，含尾逗号）。
+    comma_after: Option<usize>,
+}
+
+/// 扫描顶层对象的成员键与值区间。非对象/解析失败返回 None。
+/// 只识别 `{` 起始的顶层对象；字符串/注释内容不参与结构判断。
+fn jsonc_top_level_members(text: &str) -> Option<Vec<JsoncMember>> {
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    let n = bytes.len();
+    // 跳到第一个非空白字符，必须是 {
+    while i < n && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= n || bytes[i] != b'{' {
+        return None;
+    }
+    i += 1; // 跳过 '{'
+    let mut members: Vec<JsoncMember> = Vec::new();
+    let mut pending_comma: Option<usize> = None;
+    let mut expect_member = true;
+    while i < n {
+        let c = bytes[i];
+        match c {
+            b'"' => {
+                let key_start = i;
+                let (key, key_end) = scan_jsonc_string(bytes, i)?;
+                // 跳过空白与注释找冒号
+                i = skip_ws_comments(bytes, key_end);
+                if i >= n || bytes[i] != b':' {
+                    return None;
+                }
+                i = skip_ws_comments(bytes, i + 1);
+                let value_end = scan_jsonc_value_end(bytes, i)?;
+                members.push(JsoncMember {
+                    key,
+                    key_start,
+                    value_end,
+                    comma_before: pending_comma,
+                    comma_after: None,
+                });
+                pending_comma = None;
+                expect_member = false;
+                i = value_end;
+            }
+            b',' => {
+                let pos = i;
+                if let Some(last) = members.last_mut() {
+                    last.comma_after = Some(pos);
+                }
+                pending_comma = Some(pos);
+                expect_member = true;
+                i += 1;
+            }
+            b'}' => {
+                // 尾逗号后 expect_member 仍 true 也算合法结束
+                let _ = expect_member;
+                return Some(members);
+            }
+            b'/' => {
+                i = skip_ws_comments(bytes, i);
+            }
+            _ => {
+                if c.is_ascii_whitespace() {
+                    i += 1;
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 解析 `"..."` 字符串，返回 (解码后内容, 结束位置[引号后])。
+fn scan_jsonc_string(bytes: &[u8], start: usize) -> Option<(String, usize)> {
+    if bytes.get(start) != Some(&b'"') {
+        return None;
+    }
+    let mut i = start + 1;
+    let mut decoded = String::new();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                if i + 1 >= bytes.len() {
+                    return None;
+                }
+                decoded.push(bytes[i] as char);
+                decoded.push(bytes[i + 1] as char);
+                i += 2;
+            }
+            b'"' => return Some((decoded, i + 1)),
+            b => {
+                decoded.push(b as char);
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// 跳过空白与 // 和 /* */ 注释，返回下一有效字符位置。
+fn skip_ws_comments(bytes: &[u8], mut i: usize) -> usize {
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+        } else {
+            return i;
+        }
+    }
+}
+
+/// 从值起始位置扫描到值结束（不含尾部空白/逗号）。
+fn scan_jsonc_value_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let first = *bytes.get(start)?;
+    match first {
+        b'"' => scan_jsonc_string(bytes, start).map(|(_, end)| end),
+        b'{' | b'[' => {
+            // 匹配括号，字符串/注释内不计数
+            let open = first;
+            let close = if open == b'{' { b'}' } else { b']' };
+            let mut depth = 0usize;
+            let mut i = start;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'"' => {
+                        i = scan_jsonc_string(bytes, i)?.1;
+                        continue;
+                    }
+                    b'/' => {
+                        let next = skip_ws_comments(bytes, i);
+                        if next != i {
+                            i = next;
+                            continue;
+                        }
+                        i += 1;
+                    }
+                    b if b == open => {
+                        depth += 1;
+                        i += 1;
+                    }
+                    b if b == close => {
+                        depth -= 1;
+                        i += 1;
+                        if depth == 0 {
+                            return Some(i);
+                        }
+                    }
+                    _ => i += 1,
+                }
+            }
+            None
+        }
+        _ => {
+            // 标量：到 , } ] 空白或注释起点为止
+            let mut i = start;
+            while i < bytes.len() {
+                let b = bytes[i];
+                if b == b',' || b == b'}' || b == b']' || b.is_ascii_whitespace() {
+                    break;
+                }
+                if b == b'/' && i + 1 < bytes.len()
+                    && (bytes[i + 1] == b'/' || bytes[i + 1] == b'*')
+                {
+                    break;
+                }
+                i += 1;
+            }
+            Some(i)
+        }
+    }
+}
+
+/// 在顶层对象写入/覆盖 `key = value_text`（value_text 为已序列化的 JSON 字面量）。
+/// 保留注释与其他字段的原始文本：已有键就地替换值；新键插到首个成员前
+/// （沿用其缩进），空对象则在花括号内单行写入。
+fn jsonc_set_top_level(text: &str, key: &str, value_text: &str) -> Result<String, String> {
+    let members = jsonc_top_level_members(text)
+        .ok_or("顶层不是 JSONC 对象，无法局部编辑")?;
+    let key_literal = serde_json::to_string(key)
+        .map_err(|e| format!("序列化键名失败: {e}"))?;
+    if let Some(member) = members.iter().find(|m| m.key == key) {
+        // 就地替换值：冒号位置 = key 字符串结束后跳过空白注释
+        let (_, key_end) = scan_jsonc_string(text.as_bytes(), member.key_start)
+            .ok_or("键字符串解析失败")?;
+        let colon = skip_ws_comments(text.as_bytes(), key_end);
+        if text.as_bytes().get(colon) != Some(&b':') {
+            return Err("键后未找到冒号，无法局部编辑".into());
+        }
+        let value_start = skip_ws_comments(text.as_bytes(), colon + 1);
+        let mut out = String::with_capacity(text.len() + value_text.len());
+        out.push_str(&text[..value_start]);
+        out.push_str(value_text);
+        out.push_str(&text[member.value_end..]);
+        return Ok(out);
+    }
+    // 新键：插到首个成员之前，沿用其缩进
+    let brace = text.find('{').expect("members exist implies {");
+    if members.is_empty() {
+        let mut out = String::with_capacity(text.len() + 64);
+        out.push_str(&text[..=brace]);
+        out.push_str(&format!(" {key_literal}: {value_text} "));
+        out.push_str(&text[brace + 1..]);
+        return Ok(out);
+    }
+    let first = &members[0];
+    // 首个成员的缩进 = 其行首到 key_start 的空白；与 { 同行则退化为逗号空格
+    let line_start = text[..first.key_start]
+        .rfind('\n')
+        .map(|p| p + 1)
+        .unwrap_or(brace + 1);
+    let indent = &text[line_start..first.key_start];
+    let separator = if line_start > brace + 1 && indent.trim().is_empty() {
+        format!(",\n{indent}")
+    } else {
+        ", ".to_string()
+    };
+    let mut out = String::with_capacity(text.len() + 64);
+    out.push_str(&text[..first.key_start]);
+    out.push_str(&format!("{key_literal}: {value_text}{separator}"));
+    out.push_str(&text[first.key_start..]);
+    Ok(out)
+}
+
+/// 删除顶层成员（含相邻逗号之一），其余文本保留。
+fn jsonc_remove_top_level(text: &str, key: &str) -> Result<String, String> {
+    let members = jsonc_top_level_members(text)
+        .ok_or("顶层不是 JSONC 对象，无法局部编辑")?;
+    let Some(idx) = members.iter().position(|m| m.key == key) else {
+        return Ok(text.to_string());
+    };
+    let member = &members[idx];
+    let (start, end) = if members.len() == 1 {
+        // 唯一成员：连同前后逗号（若有，非严格 JSON 但容忍）整体移除
+        let start = member.comma_before.unwrap_or(member.key_start);
+        let end = member.comma_after.map(|p| p + 1).unwrap_or(member.value_end);
+        (start, end)
+    } else if idx == 0 {
+        // 首成员：删到后一个成员的 key_start（带走中间逗号与空白）
+        let next_start = members[1].key_start;
+        (member.key_start, next_start)
+    } else {
+        // 中间/末成员：从前一个逗号删到本成员值结束
+        let start = member.comma_before.unwrap_or(member.key_start);
+        let end = member.value_end;
+        (start, end)
+    };
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&text[..start]);
+    out.push_str(&text[end..]);
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Default)]
 struct DevinProxySettings {
     http_proxy: Option<String>,
+    /// 旧版误写的嵌套 http.proxy 字段存在（仅提示，不删除）
+    legacy_nested_proxy: bool,
     agent_env_keys: Vec<String>,
     parse_error: bool,
 }
@@ -826,20 +1249,36 @@ fn read_devin_proxy_settings(settings_path: &Path) -> DevinProxySettings {
             return result;
         }
     };
-    let value: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(value) => value,
-        Err(_) => {
+    let value: serde_json::Value = match parse_settings_jsonc(&content) {
+        Some(value) => value,
+        None => {
             result.parse_error = true;
             return result;
         }
     };
+    // VS Code 系 settings.json 使用扁平键 "http.proxy"；嵌套对象形式是旧版
+    // 误写，仅作读取兼容，不再写入。
+    let as_proxy_string = |v: &serde_json::Value| {
+        v.as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
     result.http_proxy = value
+        .get("http.proxy")
+        .and_then(as_proxy_string)
+        .or_else(|| {
+            value
+                .get("http")
+                .and_then(|http| http.get("proxy"))
+                .and_then(as_proxy_string)
+        });
+    result.legacy_nested_proxy = value
         .get("http")
         .and_then(|http| http.get("proxy"))
         .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
     // agentEnv 可能挂在 "devin.acp.agentEnv" 或含 agentEnv 的键下
     let mut collect_agent_env = |value: &serde_json::Value| {
         if let Some(obj) = value.as_object() {
@@ -872,6 +1311,129 @@ fn read_devin_proxy_settings(settings_path: &Path) -> DevinProxySettings {
     result.agent_env_keys.sort();
     result.agent_env_keys.dedup();
     result
+}
+
+/// PAC 诊断项（独立函数以便单测）。返回 (item, confirmed_issue, stale_pac)：
+/// 只有“生效中的 PAC（flags 含 0x04）指向死端口”才是真故障；
+/// 未启用的残留 PAC 字符串（如 flags=0x03）标 ok、无需处理。
+fn build_pac_item(
+    registry: &RegistryProxyInfo,
+    pac_listening: Option<bool>,
+) -> (DiagnosticItem, bool, bool) {
+    if registry.pac_active {
+        match (&registry.pac_target, pac_listening) {
+            (Some((host, port)), Some(false)) => {
+                let item = DiagnosticItem::new(
+                    "proxy.pac_stale",
+                    "proxy",
+                    "PAC 自动配置脚本",
+                    CheckStatus::ConfirmedIssue,
+                    format!("当前代理模式已启用 PAC（自动配置脚本），但指向 {host}:{port}（无监听），走 PAC 的流量将被丢弃"),
+                );
+                let mut evidence = vec![format!("pac_active=true, pac_target={host}:{port}, listening=false")];
+                if registry.pac_hidden_query {
+                    evidence.push("PAC URL 含查询参数（已隐藏）".to_string());
+                }
+                (item.with_evidence(evidence), true, true)
+            }
+            (Some((host, port)), Some(true)) => {
+                let item = DiagnosticItem::new(
+                    "proxy.pac",
+                    "proxy",
+                    "PAC 自动配置脚本",
+                    CheckStatus::Ok,
+                    format!("当前代理模式已启用 PAC，{host}:{port} 端口在监听"),
+                );
+                let mut evidence = vec![format!("pac_active=true, {host}:{port} listening=true")];
+                if registry.pac_hidden_query {
+                    evidence.push("PAC URL 含查询参数（已隐藏）".to_string());
+                }
+                (item.with_evidence(evidence), false, false)
+            }
+            (Some((host, port)), None) => {
+                let mut item = DiagnosticItem::new(
+                    "proxy.pac",
+                    "proxy",
+                    "PAC 自动配置脚本",
+                    CheckStatus::Unknown,
+                    format!("当前代理模式已启用 PAC，指向 {host}:{port}（非本机地址，无法探测）"),
+                );
+                if registry.pac_hidden_query {
+                    item = item.with_evidence(["PAC URL 含查询参数（已隐藏）".to_string()]);
+                }
+                (item, false, false)
+            }
+            (None, _) => (
+                DiagnosticItem::new(
+                    "proxy.pac",
+                    "proxy",
+                    "PAC 自动配置脚本",
+                    CheckStatus::Unknown,
+                    "当前代理模式已启用 PAC，但无法解析目标地址".to_string(),
+                ),
+                false,
+                false,
+            ),
+        }
+    } else if registry.pac_configured {
+        // 仅残留字符串（如 flags=0x03 手动代理开、PAC 关）：不是故障
+        let mut evidence = Vec::new();
+        if let Some((host, port)) = &registry.pac_target {
+            evidence.push(format!("pac_active=false, pac_target={host}:{port}"));
+        }
+        if registry.pac_hidden_query {
+            evidence.push("PAC URL 含查询参数（已隐藏）".to_string());
+        }
+        (
+            DiagnosticItem::new(
+                "proxy.pac",
+                "proxy",
+                "PAC 自动配置脚本",
+                CheckStatus::Ok,
+                "存在未启用的 PAC 残留字符串（当前代理模式未启用 PAC），不影响代理行为，无需处理".to_string(),
+            )
+            .with_evidence(evidence),
+            false,
+            false,
+        )
+    } else {
+        (
+            DiagnosticItem::new(
+                "proxy.pac",
+                "proxy",
+                "PAC 自动配置脚本",
+                CheckStatus::Ok,
+                "DefaultConnectionSettings 中没有 PAC 配置".to_string(),
+            ),
+            false,
+            false,
+        )
+    }
+}
+
+/// “可能存在代理问题，待对照验证”项（独立函数以便单测）。
+/// 这只是假设而非已确认故障：系统代理/TUN/环境变量可能已接管流量；
+/// 端口监听不证明是可用 HTTP 代理；网络慢也可能与代理无关。
+fn build_ineffective_item(listening_ports: &[u16]) -> DiagnosticItem {
+    DiagnosticItem::new(
+        "proxy.ineffective",
+        "proxy",
+        "可能存在代理问题，待对照验证",
+        CheckStatus::Unknown,
+        format!(
+            "Devin 未配置 http.proxy，且到 codeium 服务的网络不稳定，本机检测到在监听的端口 {}。\
+             这不构成已确认的故障：系统代理/TUN 模式/环境变量代理可能已接管流量；\
+             端口在监听不能证明它是可用的 HTTP 代理；网络慢也可能与代理无关。\
+             可尝试把代理写入 http.proxy 做对照验证（低成本、可回滚）。\
+             该 agent 的 system 代理模式支持平台原生 PAC（官方 troubleshooting 文档），\
+             但环境变量代理与设置文件代理是更明确的路径",
+            listening_ports
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    )
 }
 
 fn collect_proxy_info(profile: &Path, network: &[NetworkProbeResult]) -> (ProxySection, Vec<DiagnosticItem>) {
@@ -984,69 +1546,16 @@ fn collect_proxy_info(profile: &Path, network: &[NetworkProbeResult]) -> (ProxyS
         ),
     });
 
-    // PAC 残留项
-    items.push(if registry.pac_detected {
-        match (&registry.pac_target, pac_listening) {
-            (Some((host, port)), Some(false)) => {
-                confirmed_issue = true;
-                stale_pac = true;
-                let item = DiagnosticItem::new(
-                    "proxy.pac_stale",
-                    "proxy",
-                    "PAC 自动配置脚本",
-                    CheckStatus::ConfirmedIssue,
-                    format!("DefaultConnectionSettings 中残留 PAC 配置，指向 {host}:{port}（无监听），该软件可能已退出"),
-                );
-                let mut evidence = vec![format!("pac_target={host}:{port}, listening=false")];
-                if registry.pac_hidden_query {
-                    evidence.push("PAC URL 含查询参数（已隐藏）".to_string());
-                }
-                item.with_evidence(evidence)
-            }
-            (Some((host, port)), Some(true)) => {
-                let item = DiagnosticItem::new(
-                    "proxy.pac",
-                    "proxy",
-                    "PAC 自动配置脚本",
-                    CheckStatus::Ok,
-                    format!("PAC 配置指向 {host}:{port}，端口在监听"),
-                );
-                let mut evidence = vec![format!("pac_target={host}:{port}, listening=true")];
-                if registry.pac_hidden_query {
-                    evidence.push("PAC URL 含查询参数（已隐藏）".to_string());
-                }
-                item.with_evidence(evidence)
-            }
-            (Some((host, port)), None) => {
-                let mut item = DiagnosticItem::new(
-                    "proxy.pac",
-                    "proxy",
-                    "PAC 自动配置脚本",
-                    CheckStatus::Unknown,
-                    format!("检测到 PAC 配置指向 {host}:{port}（非本机地址，无法探测）"),
-                );
-                if registry.pac_hidden_query {
-                    item = item.with_evidence(["PAC URL 含查询参数（已隐藏）".to_string()]);
-                }
-                item
-            }
-            (None, _) => DiagnosticItem::new(
-                "proxy.pac",
-                "proxy",
-                "PAC 自动配置脚本",
-                CheckStatus::Unknown,
-                "检测到 PAC 配置但无法解析目标地址".to_string(),
-            ),
-        }
-    } else {
-        DiagnosticItem::new(
-            "proxy.pac",
-            "proxy",
-            "PAC 自动配置脚本",
-            CheckStatus::Ok,
-            "DefaultConnectionSettings 中没有 PAC 配置".to_string(),
-        )
-    });
+    // PAC 项：区分“生效中的 PAC”（flags 含 0x04）与“未启用的残留字符串”。
+    // 只有生效中的 PAC 指向死端口才是真故障；残留字符串本身不影响代理行为。
+    let (pac_item, pac_issue, pac_stale) = build_pac_item(&registry, pac_listening);
+    if pac_issue {
+        confirmed_issue = true;
+    }
+    if pac_stale {
+        stale_pac = true;
+    }
+    items.push(pac_item);
 
     // Devin settings.json 代理项
     items.push(if devin_settings.parse_error {
@@ -1070,14 +1579,22 @@ fn collect_proxy_info(profile: &Path, network: &[NetworkProbeResult]) -> (ProxyS
             )
             .with_evidence([format!("http.proxy=http://{host}:{port}, listening=false")])
         }
-        (Some((host, port)), _) => DiagnosticItem::new(
-            "proxy.devin_settings",
-            "proxy",
-            "Devin 代理设置",
-            CheckStatus::Ok,
-            format!("Devin settings.json 的 http.proxy 为 {host}:{port}"),
-        )
-        .with_evidence([format!("http.proxy={host}:{port}")]),
+        (Some((host, port)), _) => {
+            let mut evidence = vec![format!("http.proxy={host}:{port}")];
+            if devin_settings.legacy_nested_proxy {
+                evidence.push(
+                    "检测到嵌套 http.proxy 字段（历史误写形式，已保留未动）".to_string(),
+                );
+            }
+            DiagnosticItem::new(
+                "proxy.devin_settings",
+                "proxy",
+                "Devin 代理设置",
+                CheckStatus::Ok,
+                format!("Devin settings.json 的 http.proxy 为 {host}:{port}"),
+            )
+            .with_evidence(evidence)
+        }
         (None, _) => DiagnosticItem::new(
             "proxy.devin_settings",
             "proxy",
@@ -1134,7 +1651,11 @@ fn collect_proxy_info(profile: &Path, network: &[NetworkProbeResult]) -> (ProxyS
         .with_evidence(endpoints.iter().map(|e| format!("endpoint={e}"))));
     }
 
-    // 无效代理判定：Devin 未配 http.proxy + codeium 系网络差 + 本机有可用代理端口
+    // 待对照验证项：Devin 未配 http.proxy + codeium 系网络差 + 本机有在监听端口。
+    // 注意这只是一种假设——系统代理/TUN 模式/环境变量代理可能已接管流量，
+    // 端口在监听不能证明它是可用的 HTTP 代理，网络慢也可能与代理无关——
+    // 因此状态为 unknown，不升级为 confirmed_issue（confirmed_proxy_issue
+    // 仍置位，供 summary 与修复入口做"对照验证"推荐）。
     let codeium_degraded = network.iter().any(|probe| {
         probe.host.ends_with("codeium.com")
             && matches!(
@@ -1147,20 +1668,7 @@ fn collect_proxy_info(profile: &Path, network: &[NetworkProbeResult]) -> (ProxyS
         && !listening_ports.is_empty();
     if ineffective_proxy {
         confirmed_issue = true;
-        items.push(DiagnosticItem::new(
-            "proxy.ineffective",
-            "proxy",
-            "代理未接入 Devin",
-            CheckStatus::ConfirmedIssue,
-            format!(
-                "Devin 未配置 http.proxy，且到 codeium 服务的网络不稳定；本机检测到在监听的代理端口 {}",
-                listening_ports
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ));
+        items.push(build_ineffective_item(&listening_ports));
     }
 
     let section = ProxySection {
@@ -1169,7 +1677,8 @@ fn collect_proxy_info(profile: &Path, network: &[NetworkProbeResult]) -> (ProxyS
             .as_ref()
             .map(|(host, port)| format!("{host}:{port}")),
         system_proxy_listening: system_listening,
-        pac_detected: registry.pac_detected,
+        pac_configured: registry.pac_configured,
+        pac_active: registry.pac_active,
         pac_target: registry
             .pac_target
             .as_ref()
@@ -1296,6 +1805,8 @@ fn probe_host(host: &str) -> NetworkProbeResult {
             None
         },
         classification,
+        // 管理器探测始终走 TcpStream 直连，不代表 Devin 子进程的实际路径
+        path: "direct".to_string(),
         risk_note,
     }
 }
@@ -1385,6 +1896,7 @@ fn run_network_probes() -> (Vec<NetworkProbeResult>, Vec<DiagnosticItem>) {
                 tcp: None,
                 tls: None,
                 classification: "unknown".to_string(),
+                path: "unknown".to_string(),
                 risk_note: None,
             }),
         }
@@ -1477,6 +1989,28 @@ fn run_network_probes() -> (Vec<NetworkProbeResult>, Vec<DiagnosticItem>) {
 const LOG_TAIL_BYTES: u64 = 256 * 1024;
 const LOGS_EXAMINED: usize = 10;
 
+/// 失败行分类：网络超时 / 认证失败 / 权限 / 配置 / 未知。
+/// 分别展示、互不吞并——尤其不得把未知错误默认归为"额度耗尽"。
+fn classify_failure_line(line: &str) -> &'static str {
+    let lower = line.to_ascii_lowercase();
+    if line.contains("timed out") || lower.contains("timeout") {
+        "network_timeout"
+    } else if line.contains(" 401")
+        || line.contains(" 403")
+        || lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("invalid auth")
+    {
+        "auth_failed"
+    } else if lower.contains("eacces") || lower.contains("permission denied") {
+        "permission"
+    } else if lower.contains("config") {
+        "config"
+    } else {
+        "unknown"
+    }
+}
+
 fn analyze_logs(profile: &Path) -> (LogDiagnostics, Vec<DiagnosticItem>) {
     let log_dir = profile.join("cli").join("logs");
     let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
@@ -1510,6 +2044,8 @@ fn analyze_logs(profile: &Path) -> (LogDiagnostics, Vec<DiagnosticItem>) {
     let mut last_failure_at: Option<String> = None;
     let mut agent_versions: Vec<String> = Vec::new();
     let mut sample_failure_line: Option<String> = None;
+    let mut failure_categories: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
 
     for (path, len, _) in &examined {
         for line in tail_lines(path, *len).iter().map(|l| l.as_str()) {
@@ -1534,15 +2070,28 @@ fn analyze_logs(profile: &Path) -> (LogDiagnostics, Vec<DiagnosticItem>) {
                 if sample_failure_line.is_none() {
                     sample_failure_line = Some(truncate_evidence(line));
                 }
+                failure_categories.insert(classify_failure_line(line).to_string());
             }
             if is_team_settings_failure && line.contains("timed out") {
                 timeout_failures += 1;
             }
             if line.contains("ZDR status refresh timed out") {
                 zdr_timeouts += 1;
+                failure_categories.insert("network_timeout".to_string());
             }
             if line.contains("remote config revalidation failed") {
                 remote_config_failures += 1;
+                failure_categories.insert("config".to_string());
+            }
+            // 认证/权限类失败（401/403 与凭据被拒、权限错误分列展示）
+            let lower = line.to_ascii_lowercase();
+            if line.contains(" 401") || line.contains(" 403")
+                || lower.contains("unauthorized") || lower.contains("forbidden")
+            {
+                failure_categories.insert("auth_failed".to_string());
+            }
+            if lower.contains("eacces") || lower.contains("permission denied") {
+                failure_categories.insert("permission".to_string());
             }
             if is_team_settings_failure {
                 if let Some(ts) = timestamp {
@@ -1593,6 +2142,7 @@ fn analyze_logs(profile: &Path) -> (LogDiagnostics, Vec<DiagnosticItem>) {
         running_agent_pids,
         running_agents_authenticated,
         newest_log_has_auth_failure,
+        failure_categories: failure_categories.into_iter().collect(),
     };
 
     let mut items = Vec::new();
@@ -1664,7 +2214,7 @@ fn analyze_logs(profile: &Path) -> (LogDiagnostics, Vec<DiagnosticItem>) {
             "在跑 Agent 状态",
             CheckStatus::ConfirmedIssue,
             format!(
-                "PID {} 对应的最新日志中出现 team settings 认证失败；该进程认证失败后可能长驻，重启客户端可重新拉起",
+                "PID {} 对应的最新日志中出现 team settings 认证失败；该 agent 进程认证失败后仍在运行，可尝试重启 Devin 让 agent 重新认证",
                 diag.running_agent_pids.first().copied().unwrap_or(0)
             ),
         ),
@@ -1788,6 +2338,7 @@ pub fn parse_agent_version(line: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 fn build_summary(
+    client: &ClientDiagnostics,
     proxy: &ProxySection,
     network: &[NetworkProbeResult],
     logs: &LogDiagnostics,
@@ -1804,7 +2355,7 @@ fn build_summary(
         (
             "proxy_config".to_string(),
             "高：代理相关异常已由端口探测确认".to_string(),
-            "诊断发现已确认的代理配置异常（死端口 / 残留 PAC / 代理未接入 Devin），这是模型列表为空的最常见原因之一。".to_string(),
+            "诊断发现已确认的代理配置异常（死端口 / 生效中的 PAC 指向死端口 / 代理未接入 Devin），这是模型列表为空的最常见原因之一。".to_string(),
         )
     } else if codeium_degraded {
         (
@@ -1816,7 +2367,7 @@ fn build_summary(
         (
             "auth_state".to_string(),
             "中：日志中存在认证失败记录，但当前网络探测正常，可能是历史残留".to_string(),
-            "日志中存在 team settings 认证失败记录；若问题仍在持续，重启客户端让 agent 重新认证通常可恢复。".to_string(),
+            "日志中存在 team settings 认证失败记录；若问题仍在持续，可尝试重启 Devin 让 agent 重新认证。".to_string(),
         )
     } else {
         (
@@ -1830,7 +2381,7 @@ fn build_summary(
     if proxy.stale_pac_confirmed {
         fixes.push(RecommendedFix {
             id: "clear_stale_pac_config".into(),
-            label: "清除残留的 PAC 配置（手动步骤，提供指引）".into(),
+            label: "清除指向死端口的 PAC 配置（手动步骤，提供指引）".into(),
             requires_restart: false,
             affects_login: false,
             manual: true,
@@ -1839,10 +2390,25 @@ fn build_summary(
     if proxy.confirmed_proxy_issue {
         fixes.push(RecommendedFix {
             id: "apply_client_proxy_fix".into(),
-            label: "把可用的本机代理端口写入 Devin 的 http.proxy".into(),
+            label: "把可用的本机代理端口写入 Devin 的 http.proxy（对照验证用，可回滚）".into(),
             requires_restart: false,
             affects_login: false,
             manual: false,
+        });
+    }
+    // ACP 连接重载：客户端注册的官方命令，但无外部调用入口——
+    // 只能给命令面板手动指引，不模拟执行结果。
+    // 涉及元数据缓存刷新，提示可能影响会话显示。
+    let acp_issue_likely = logs.team_settings_failures > 0
+        || logs.running_agents_authenticated == Some(false)
+        || logs.newest_log_has_auth_failure;
+    if acp_issue_likely && client.acp_reload_available {
+        fixes.push(RecommendedFix {
+            id: "reload_acp_connections".into(),
+            label: "在客户端执行「Devin: Reload ACP Connections」（命令面板手动步骤）".into(),
+            requires_restart: false,
+            affects_login: false,
+            manual: true,
         });
     }
     if logs.team_settings_failures > 0
@@ -1880,7 +2446,7 @@ pub fn run_full_diagnostics() -> Result<DiagnosticsResult, String> {
     let (network, mut network_items) = run_network_probes();
     let (proxy_section, mut proxy_items) = collect_proxy_info(&profile, &network);
     let (log_diag, mut log_items) = analyze_logs(&profile);
-    let summary = build_summary(&proxy_section, &network, &log_diag);
+    let summary = build_summary(&client_info, &proxy_section, &network, &log_diag);
 
     let mut items = Vec::new();
     items.append(&mut client_items);
@@ -1938,6 +2504,30 @@ pub fn render_markdown_report(result: &DiagnosticsResult) -> String {
     md.push_str(&format!("- 综合结论: **{}**（{}）\n", result.summary.category, result.summary.confidence));
     md.push_str(&format!("- 概述: {}\n\n", result.summary.overview));
 
+    md.push_str("## 客户端环境\n\n");
+    let client = &result.client;
+    md.push_str(&format!(
+        "- 客户端: {}（存在: {}）版本: {} commit: {}\n",
+        client.exe_path.as_deref().unwrap_or("未知"),
+        client.exe_exists,
+        client.product_version.as_deref().unwrap_or("未知"),
+        client.product_commit.as_deref().unwrap_or("未知")
+    ));
+    md.push_str(&format!(
+        "- 数据目录: {}（存在: {}）settings.json: {} CLI 日志目录: {}\n",
+        client.data_dir.as_deref().unwrap_or("未知"),
+        client.data_dir_exists,
+        client.user_settings_exists,
+        client.cli_log_dir_exists
+    ));
+    md.push_str(&format!(
+        "- 进程: IDE x{} / agent x{}；ACP 命令: reload={} reconnect={}\n\n",
+        client.ide_processes_running,
+        client.agent_processes_running,
+        client.acp_reload_available,
+        client.acp_reconnect_available
+    ));
+
     md.push_str("## 检查项明细\n\n");
     for item in &result.items {
         md.push_str(&format!(
@@ -1964,8 +2554,11 @@ pub fn render_markdown_report(result: &DiagnosticsResult) -> String {
         result.proxy.system_proxy_listening
     ));
     md.push_str(&format!(
-        "- PAC: detected={} target={:?} listening={:?}\n",
-        result.proxy.pac_detected, result.proxy.pac_target, result.proxy.pac_listening
+        "- PAC: configured={} active={} target={:?} listening={:?}\n",
+        result.proxy.pac_configured,
+        result.proxy.pac_active,
+        result.proxy.pac_target,
+        result.proxy.pac_listening
     ));
     md.push_str(&format!(
         "- Devin http.proxy: {:?}\n",
@@ -1985,10 +2578,11 @@ pub fn render_markdown_report(result: &DiagnosticsResult) -> String {
     ));
 
     md.push_str("## 网络探测\n\n");
+    md.push_str("说明：探测由管理器发起、路径标为 direct 时代表直连，不能等同于 Devin 子进程业务请求的实际路径。\n\n");
     for probe in &result.network {
         md.push_str(&format!(
-            "- {}: dns_ok={} classification={} resolved={:?} tcp={:?} tls={:?}\n",
-            probe.host, probe.dns_ok, probe.classification, probe.resolved_ip, probe.tcp, probe.tls
+            "- {}: path={} dns_ok={} classification={} resolved={:?} tcp={:?} tls={:?}\n",
+            probe.host, probe.path, probe.dns_ok, probe.classification, probe.resolved_ip, probe.tcp, probe.tls
         ));
     }
     md.push('\n');
@@ -2001,6 +2595,7 @@ pub fn render_markdown_report(result: &DiagnosticsResult) -> String {
     md.push_str(&format!("- 认证尝试 / 含凭据: {} / {}\n", logs.authenticate_attempts, logs.authenticate_with_credentials));
     md.push_str(&format!("- team settings 失败 / 其中超时: {} / {}\n", logs.team_settings_failures, logs.timeout_failures));
     md.push_str(&format!("- ZDR 超时 / remote config 失败: {} / {}\n", logs.zdr_timeouts, logs.remote_config_failures));
+    md.push_str(&format!("- 失败类别: {:?}\n", logs.failure_categories));
     md.push_str(&format!("- 最近一次失败时间: {:?}\n", logs.last_failure_at));
     md.push_str(&format!("- agent 版本: {:?}\n", logs.agent_versions));
     md.push_str(&format!("- 在跑 agent PID: {:?}（认证正常: {:?}）\n\n", logs.running_agent_pids, logs.running_agents_authenticated));
@@ -2037,6 +2632,23 @@ pub async fn get_last_diagnostics() -> Result<Option<DiagnosticsResult>, String>
         .map_err(|e| format!("读取诊断缓存失败: {e}"))
 }
 
+/// 导出前预览：返回完整脱敏后的 Markdown 文本，不落盘。
+#[tauri::command]
+pub async fn preview_diagnostics_report() -> Result<String, String> {
+    tokio::task::spawn_blocking(|| {
+        let result = load_last_diagnostics()
+            .ok_or("尚无诊断结果，请先运行诊断")?;
+        // 反馈记录独立于诊断结果持久化，拼接后整体再过一遍脱敏
+        Ok(redact_text(&format!(
+            "{}{}",
+            render_markdown_report(&result),
+            render_feedback_section()
+        )))
+    })
+    .await
+    .map_err(|e| format!("预览任务执行失败: {e}"))?
+}
+
 #[tauri::command]
 pub async fn export_diagnostics_report() -> Result<String, String> {
     tokio::task::spawn_blocking(|| -> Result<String, String> {
@@ -2044,7 +2656,11 @@ pub async fn export_diagnostics_report() -> Result<String, String> {
             .ok_or("尚无诊断结果，请先运行诊断")?;
         let dir = diagnostics_dir()?;
         let path = dir.join(format!("diagnostics-report-{}.md", timestamp_slug()));
-        let markdown = render_markdown_report(&result);
+        let markdown = redact_text(&format!(
+            "{}{}",
+            render_markdown_report(&result),
+            render_feedback_section()
+        ));
         crate::modules::atomic_write::write_string_atomic(&path, &markdown)?;
         Ok(path.to_string_lossy().into_owned())
     })
@@ -2058,13 +2674,265 @@ pub struct ProxyFixOutcome {
     pub settings_path: String,
     pub new_proxy: String,
     pub backup_path: String,
+    /// 检测到旧版误写的嵌套 "http":{"proxy":…} 字段（未删除，仅提示）
+    pub legacy_nested_proxy_present: bool,
+    /// 写后回读验证：当前文件里的 http.proxy 与写入值一致
+    pub write_verified: bool,
+    /// 本工具记录的写入状态文件（供「恢复本次代理修改」比对）
+    pub state_path: String,
 }
 
-/// 恢复操作：把 `http://127.0.0.1:<port>` 写入 Devin 的 User/settings.json 的
-/// `http.proxy` 字段。仅当最近一次诊断确认了代理异常、且端口当前确实在监听
-/// 时才允许执行；写前备份原文件到本应用数据目录，写失败自动回退。
+fn default_true() -> bool {
+    true
+}
+
+/// 撤销恢复操作的凭据：仅当当前值仍等于我们上次写入的值时才允许还原。
+/// 记录写入前的原值与文件原本是否存在，恢复是「还原原状」而非简单删除。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProxyFixState {
+    written_value: String,
+    /// 写入前 settings.json 里原有的 http.proxy 值；原本没有该键时为 None。
+    /// 旧版记录没有该字段：默认为 None 配合 settings_existed=true → 退化为
+    /// 原来的"移除该键"行为。
+    #[serde(default)]
+    previous_value: Option<String>,
+    /// 写入前 settings.json 是否已存在（本工具新建的文件恢复时应删回）。
+    /// 旧版记录没有该字段：默认为 true → 只移除键、保留文件。
+    #[serde(default = "default_true")]
+    settings_existed: bool,
+    settings_path: String,
+    backup_path: String,
+    written_at_ms: i64,
+    app_version: String,
+}
+
+/// 给前端的撤销入口信息（不暴露多余数据，路径用于提示）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProxyFixStateInfo {
+    pub written_value: String,
+    pub previous_value: Option<String>,
+    pub written_at_ms: i64,
+    pub settings_path: String,
+    pub backup_path: String,
+}
+
+/// 展示用脱敏：代理值可能含 `user:pass@` 认证信息或带敏感查询参数，
+/// 前端只拿脱敏后的形态；恢复用的完整原值只留在后端状态文件里。
+fn mask_proxy_display(value: &str) -> String {
+    let mut out = value.to_string();
+    // userinfo：scheme:// 之后、第一个 @ 之前
+    if let Some(scheme_end) = out.find("://") {
+        if let Some(at) = out.find('@') {
+            if at > scheme_end + 3 {
+                out = format!("{}***{}", &out[..scheme_end + 3], &out[at..]);
+            }
+        }
+    }
+    // 查询参数可能带 token/key
+    if let Some(q) = out.find('?') {
+        out.truncate(q);
+        out.push_str("?<redacted>");
+    }
+    out
+}
+
+fn state_info(s: &ProxyFixState) -> ProxyFixStateInfo {
+    ProxyFixStateInfo {
+        written_value: mask_proxy_display(&s.written_value),
+        previous_value: s.previous_value.as_deref().map(mask_proxy_display),
+        written_at_ms: s.written_at_ms,
+        settings_path: s.settings_path.clone(),
+        backup_path: s.backup_path.clone(),
+    }
+}
+
+/// 只读查询：是否存在本工具写入、尚未恢复的代理修改记录。
+/// 跨页面/重启应用后撤销入口据此保留。
+#[tauri::command]
+pub fn get_proxy_fix_state() -> Option<ProxyFixStateInfo> {
+    load_proxy_fix_state().map(|s| state_info(&s))
+}
+
+fn proxy_fix_state_path() -> Result<PathBuf, String> {
+    Ok(diagnostics_dir()?.join("proxy-fix-state.json"))
+}
+
+fn load_proxy_fix_state() -> Option<ProxyFixState> {
+    let path = proxy_fix_state_path().ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+// ---- 恢复结果用户反馈（持久化，纳入报告） ----
+
+/// 用户在执行恢复操作后对结果的人工确认。verdict ∈ confirmed/unresolved。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryFeedback {
+    pub recorded_at_ms: i64,
+    /// 可读时间戳（与日志/报告一致口径）。
+    pub recorded_at: String,
+    pub verdict: String,
+}
+
+fn recovery_feedback_path() -> Result<PathBuf, String> {
+    Ok(diagnostics_dir()?.join("recovery-feedback.json"))
+}
+
+fn load_recovery_feedback() -> Vec<RecoveryFeedback> {
+    recovery_feedback_path()
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// 把反馈追加进 JSON 数组文件（保留最近 50 条）。供命令与测试共用。
+fn append_recovery_feedback(path: &Path, verdict: &str) -> Result<(), String> {
+    let mut list: Vec<RecoveryFeedback> = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    list.push(RecoveryFeedback {
+        recorded_at_ms: now_ms(),
+        recorded_at: timestamp_slug(),
+        verdict: verdict.to_string(),
+    });
+    if list.len() > 50 {
+        list.drain(..list.len() - 50);
+    }
+    let json = serde_json::to_string_pretty(&list)
+        .map_err(|e| format!("序列化反馈记录失败: {e}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建反馈目录失败: {e}"))?;
+    }
+    crate::modules::atomic_write::write_string_atomic(path, &json)
+}
+
+/// 持久化记录用户对恢复结果的人工确认；写失败如实报错，
+/// 前端据此决定能否显示「已记录」。
+#[tauri::command]
+pub async fn record_recovery_feedback(verdict: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        match verdict.as_str() {
+            "confirmed" | "unresolved" => {}
+            other => return Err(format!("无效的反馈类型: {other}")),
+        }
+        append_recovery_feedback(&recovery_feedback_path()?, &verdict)
+    })
+    .await
+    .map_err(|e| format!("反馈记录任务失败: {e}"))?
+}
+
+/// 报告小节：渲染持久化的恢复反馈记录（无记录时如实说明）。
+fn feedback_section_md(list: &[RecoveryFeedback]) -> String {
+    let mut md = String::from("## 恢复结果反馈记录\n\n");
+    if list.is_empty() {
+        md.push_str("- （尚无用户确认记录）\n\n");
+        return md;
+    }
+    for fb in list {
+        let label = match fb.verdict.as_str() {
+            "confirmed" => "已显示且消息正常",
+            "unresolved" => "仍未恢复",
+            other => other,
+        };
+        md.push_str(&format!("- {} → {}\n", fb.recorded_at, label));
+    }
+    md.push('\n');
+    md
+}
+
+fn render_feedback_section() -> String {
+    feedback_section_md(&load_recovery_feedback())
+}
+
+/// 端口探测：不是"端口在监听"就算代理——必须完成一次真实 HTTP CONNECT
+/// 握手才算可用。返回 Ok(()) 仅当代理回了 2xx；其余如实分类。
+#[derive(Debug, Clone, PartialEq)]
+enum ProxyProbeError {
+    Refused,
+    Timeout,
+    NotHttpProxy,
+    AuthRequired,
+    Failed(String),
+}
+
+fn probe_http_connect_proxy(port: u16) -> Result<(), ProxyProbeError> {
+    use std::io::{Read, Write};
+    let addr: SocketAddr = match format!("127.0.0.1:{port}").parse() {
+        Ok(a) => a,
+        Err(_) => return Err(ProxyProbeError::Refused),
+    };
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
+        .map_err(|_| ProxyProbeError::Refused)?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(4)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(4)));
+    // CONNECT 到认证服务域名——与 Devin 实际会走路径一致
+    let request = "CONNECT server.codeium.com:443 HTTP/1.1\r\nHost: server.codeium.com:443\r\n\r\n";
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| ProxyProbeError::Failed(format!("发送 CONNECT 失败: {e}")))?;
+    let mut buf = [0u8; 512];
+    let n = match stream.read(&mut buf) {
+        Ok(n) => n,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+            || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            return Err(ProxyProbeError::Timeout)
+        }
+        Err(e) => return Err(ProxyProbeError::Failed(format!("读取响应失败: {e}"))),
+    };
+    if n == 0 {
+        return Err(ProxyProbeError::NotHttpProxy);
+    }
+    let head = String::from_utf8_lossy(&buf[..n]);
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok());
+    if !head.starts_with("HTTP/") {
+        return Err(ProxyProbeError::NotHttpProxy);
+    }
+    match status {
+        Some(code) if (200..300).contains(&code) => Ok(()),
+        Some(407) => Err(ProxyProbeError::AuthRequired),
+        Some(code) => Err(ProxyProbeError::Failed(format!("代理返回 HTTP {code}"))),
+        None => Err(ProxyProbeError::NotHttpProxy),
+    }
+}
+
+fn proxy_probe_error_message(port: u16, err: &ProxyProbeError) -> String {
+    match err {
+        ProxyProbeError::Refused => {
+            format!("端口 {port} 没有监听（连接被拒），已中止（未修改任何文件）")
+        }
+        ProxyProbeError::Timeout => {
+            format!("端口 {port} 接受连接但未在超时内回应 HTTP 代理握手，已中止")
+        }
+        ProxyProbeError::NotHttpProxy => {
+            format!("端口 {port} 在监听但不是 HTTP 代理（CONNECT 握手未通过），已中止")
+        }
+        ProxyProbeError::AuthRequired => {
+            format!("端口 {port} 是 HTTP 代理但要求认证（407），Devin 无法直接使用，已中止")
+        }
+        ProxyProbeError::Failed(reason) => {
+            format!("端口 {port} 代理握手失败：{reason}，已中止")
+        }
+    }
+}
+
+/// 恢复操作：把 `http://127.0.0.1:<port>` 写入 Devin 的 User/settings.json
+/// 顶层扁平键 `"http.proxy"`。门禁：与切号共用操作锁 + 在途切号阻断 +
+/// 最近一次诊断存在代理相关发现（已确认或疑似）+ 端口通过真实 HTTP
+/// CONNECT 握手。写前备份原文件；写入与并发修改冲突时中止；写后回读核对。
 #[tauri::command]
 pub async fn apply_client_proxy_fix(port: u16) -> Result<ProxyFixOutcome, String> {
+    let _guard = crate::CLIENT_LOCK
+        .try_lock()
+        .map_err(|_| "正在操作客户端，请稍后再试")?;
     tokio::task::spawn_blocking(move || apply_client_proxy_fix_inner(port))
         .await
         .map_err(|e| format!("修复任务执行失败: {e}"))?
@@ -2074,90 +2942,370 @@ fn apply_client_proxy_fix_inner(port: u16) -> Result<ProxyFixOutcome, String> {
     if port == 0 {
         return Err("端口无效".into());
     }
-    if !is_local_port_listening(port) {
-        return Err(format!("端口 {port} 当前没有监听，已中止（未修改任何文件）"));
-    }
+    let _file_guard = crate::modules::process::lock_client_operation()?;
+    crate::modules::quota_monitor::global()
+        .ensure_no_in_flight_switch()
+        .map_err(|code| crate::modules::quota_monitor::confirm_error_message(&code))?;
     let last = load_last_diagnostics().ok_or("尚未运行诊断，无法确认代理异常")?;
-    if !last.proxy.confirmed_proxy_issue {
-        return Err("最近一次诊断未确认代理异常，已拒绝执行修复".into());
+    if !last.proxy.confirmed_proxy_issue && !last.proxy.ineffective_proxy_confirmed {
+        return Err(
+            "最近一次诊断未发现代理相关异常（已确认或疑似均否），已拒绝执行修复".into(),
+        );
     }
+    // 已有未撤销的修改时禁止再写：否则覆盖状态文件会丢掉上一次的还原凭据
+    if load_proxy_fix_state().is_some() {
+        return Err("存在尚未撤销的代理修改记录，请先「撤销本次修改」再写入新的代理设置".into());
+    }
+    // 端口监听 ≠ 可用代理：必须完成真实 CONNECT 握手
+    probe_http_connect_proxy(port)
+        .map_err(|e| proxy_probe_error_message(port, &e))?;
     let profile = client::get_default_windsurf_user_data_dir()?;
     let settings_path = devin_settings_path(&profile);
     let backup_dir = diagnostics_dir()?.join("backups");
     std::fs::create_dir_all(&backup_dir).map_err(|e| format!("创建备份目录失败: {e}"))?;
     let backup_path = backup_dir.join(format!("devin-user-settings-{}.json", timestamp_slug()));
-    apply_proxy_fix_to_settings(
+    let state_path = proxy_fix_state_path()?;
+    let outcome = apply_proxy_fix_to_settings(
         port,
         &settings_path,
         &backup_path,
-        &|path, content| crate::modules::atomic_write::write_string_atomic(path, content),
-    )
+        &state_path,
+        &|path, expected, new_content| {
+            crate::modules::atomic_write::replace_secret_string_if_matches(
+                path,
+                expected,
+                Some(new_content),
+            )
+        },
+    )?;
+    Ok(outcome)
 }
 
-/// 核心写逻辑（与真实环境解耦以便单测）：备份原文件 → 仅修改 `http.proxy`
-/// 字段（其余内容原样保留）→ 原子写入 → 写失败自动回退。
-/// `write_file` 是写入口，测试可注入失败场景。
+/// 核心写逻辑（与真实环境解耦以便单测）：
+/// 备份原始字节 → **先落盘撤销记录**（含写入前的原值，保证修改成功后
+/// 必有可恢复凭据；失败则中止不碰配置）→ JSONC 局部编辑顶层
+/// `"http.proxy"`（注释/其他字段/格式逐字节保留；历史嵌套不删只提示）
+/// → 条件原子写（期间被并发修改则中止并清理记录）→ 写后回读核对。
+/// `write_if_unchanged(path, expected, new)` 仅当当前内容与 expected 一致
+/// 时才写入；返回 Ok(false) 表示内容已变化、未写。
 fn apply_proxy_fix_to_settings(
     port: u16,
     settings_path: &Path,
     backup_path: &Path,
-    write_file: &dyn Fn(&Path, &str) -> Result<(), String>,
+    state_path: &Path,
+    write_if_unchanged: &dyn Fn(&Path, Option<&str>, &str) -> Result<bool, String>,
 ) -> Result<ProxyFixOutcome, String> {
-    let settings_existed = settings_path.is_file();
-    let content = std::fs::read_to_string(settings_path).unwrap_or_default();
-    let mut value: serde_json::Value = if content.trim().is_empty() {
-        serde_json::json!({})
-    } else {
-        serde_json::from_str(&content)
-            .map_err(|_| "Devin settings.json 不是合法 JSON，已中止（未做任何修改）")?
+    let content = match std::fs::read_to_string(settings_path) {
+        Ok(c) => Some(c),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("读取 settings.json 失败，已中止: {e}")),
+    };
+    let value: serde_json::Value = match content.as_deref() {
+        None | Some("") => serde_json::json!({}),
+        Some(c) if c.trim().is_empty() => serde_json::json!({}),
+        Some(c) => match parse_settings_jsonc(c) {
+            Some(v) => v,
+            None => {
+                return Err("Devin settings.json 不是合法 JSON/JSONC，已中止（未做任何修改）".into())
+            }
+        },
     };
     if !value.is_object() {
         return Err("Devin settings.json 顶层不是 JSON 对象，已中止（未做任何修改）".into());
     }
+    // 历史误写检测（不自动删除，不猜测来源）
+    let legacy_nested = value
+        .get("http")
+        .and_then(|h| h.get("proxy"))
+        .and_then(|v| v.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
 
-    // 备份原文件（写失败时据此回退）
+    // 备份原始字节（写失败/要还原时用它）
     if let Some(parent) = backup_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建备份目录失败: {e}"))?;
     }
-    if settings_existed {
-        std::fs::copy(settings_path, backup_path)
-            .map_err(|e| format!("备份原 settings.json 失败，已中止: {e}"))?;
-    } else {
-        // 文件不存在：写一个空对象占位备份，恢复时可删除 http.proxy
-        write_file(backup_path, "{}")?;
+    match &content {
+        Some(c) => {
+            std::fs::write(backup_path, c)
+                .map_err(|e| format!("备份原 settings.json 失败，已中止: {e}"))?;
+        }
+        None => {
+            std::fs::write(backup_path, "{}")
+                .map_err(|e| format!("写占位备份失败，已中止: {e}"))?;
+        }
     }
 
     let new_proxy = format!("http://127.0.0.1:{port}");
-    let write_result = {
-        let obj = value.as_object_mut().expect("checked object above");
-        let http = obj
-            .entry("http".to_string())
-            .or_insert_with(|| serde_json::json!({}));
-        if !http.is_object() {
-            *http = serde_json::json!({});
-        }
-        http.as_object_mut()
-            .expect("checked object above")
-            .insert("proxy".to_string(), serde_json::Value::String(new_proxy.clone()));
-        serde_json::to_string_pretty(&value)
-            .map_err(|e| format!("序列化 settings.json 失败: {e}"))
-            .and_then(|serialized| write_file(settings_path, &serialized))
+    let value_literal = serde_json::to_string(&new_proxy)
+        .map_err(|e| format!("序列化代理值失败: {e}"))?;
+    let base = content.as_deref().unwrap_or("{}");
+    let new_content = if base.trim().is_empty() {
+        format!("{{\n  \"http.proxy\": {value_literal}\n}}\n")
+    } else {
+        jsonc_set_top_level(base, "http.proxy", &value_literal)
+            .map_err(|e| format!("局部编辑 settings.json 失败，已中止: {e}"))?
     };
 
-    if let Err(write_error) = write_result {
-        // 回退：尽力恢复原文件内容；原本不存在的文件则删除，避免留下空文件
-        if settings_existed {
-            let _ = write_file(settings_path, &content);
-        } else {
-            let _ = std::fs::remove_file(settings_path);
+    // 已存在撤销记录 → 说明有未还原的修改，拒绝再写：
+    // 覆盖会丢掉上一次的原值凭据；也保证下方失败清理删的只可能是本次
+    // 刚创建的记录。
+    if state_path.exists() {
+        return Err("已存在未撤销的代理修改记录，请先撤销后再写入（本次未做任何修改）".into());
+    }
+
+    // 先落盘撤销记录（写入前原值 + 文件原本是否存在），再动配置：
+    // 修改一旦成功，可恢复凭据必然已在盘上。记录写不进去就直接中止，
+    // 不留"改了却没法自动还原"的部分成功状态。
+    let state = ProxyFixState {
+        written_value: new_proxy.clone(),
+        previous_value: value
+            .get("http.proxy")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        settings_existed: content.is_some(),
+        settings_path: settings_path.to_string_lossy().into_owned(),
+        backup_path: backup_path.to_string_lossy().into_owned(),
+        written_at_ms: now_ms(),
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
+    };
+    let state_json = serde_json::to_string_pretty(&state)
+        .map_err(|e| format!("序列化代理修改状态失败: {e}"))?;
+    if let Some(parent) = state_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建状态目录失败，已中止: {e}"))?;
+    }
+    crate::modules::atomic_write::write_string_atomic(state_path, &state_json)
+        .map_err(|e| format!("撤销记录保存失败，已中止（未修改任何配置）: {e}"))?;
+
+    // 条件写：仅当文件仍是刚才读到的内容才落盘，并发修改 → 中止并清理记录
+    match write_if_unchanged(settings_path, content.as_deref(), &new_content) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = std::fs::remove_file(state_path);
+            return Err("settings.json 在写入前被其他程序修改，已中止（未做任何修改），请重新诊断后重试".into());
         }
-        return Err(format!("写入 settings.json 失败，已恢复原内容: {write_error}"));
+        Err(write_error) => {
+            let _ = std::fs::remove_file(state_path);
+            return Err(format!("写入 settings.json 失败（原文件未被改动）: {write_error}"));
+        }
+    }
+
+    // 写后回读核对：不得在未核对前声称已生效
+    let verified = match std::fs::read_to_string(settings_path)
+        .ok()
+        .and_then(|t| parse_settings_jsonc(&t))
+        .and_then(|v| v.get("http.proxy").and_then(|p| p.as_str()).map(str::to_string))
+    {
+        Some(v) if v == new_proxy => true,
+        _ => false,
+    };
+    if !verified {
+        return Err(format!(
+            "写入已提交但回读校验未通过（http.proxy 未呈现新值）。请检查文件状态；备份位于: {}",
+            backup_path.display()
+        ));
     }
 
     Ok(ProxyFixOutcome {
         settings_path: settings_path.to_string_lossy().into_owned(),
         new_proxy,
         backup_path: backup_path.to_string_lossy().into_owned(),
+        legacy_nested_proxy_present: legacy_nested,
+        write_verified: verified,
+        state_path: state_path.to_string_lossy().into_owned(),
+    })
+}
+
+/// 撤销恢复操作：仅当 settings.json 里 http.proxy 仍等于本工具上次写入
+/// 的值时还原（删除该键），其余设置原样保留；值被用户改过时拒绝自动
+/// 恢复并给出备份位置。
+#[tauri::command]
+pub async fn revert_client_proxy_fix() -> Result<ProxyFixOutcome, String> {
+    let _guard = crate::CLIENT_LOCK
+        .try_lock()
+        .map_err(|_| "正在操作客户端，请稍后再试")?;
+    tokio::task::spawn_blocking(revert_client_proxy_fix_inner)
+        .await
+        .map_err(|e| format!("恢复任务执行失败: {e}"))?
+}
+
+/// 可测试的恢复核心：仅当 settings.json 里 http.proxy 仍等于
+/// `expected_written_value` 时还原为写入前的原状（其余内容保留）：
+/// - `previous_value` 有原值 → 写回原值；无原值 → 移除该键；
+/// - `settings_existed=false`（文件由本工具创建）且移除后对象为空 →
+///   删除整个文件，还原"文件本不存在"的状态。
+/// 值被改动过时拒绝自动恢复并给出备份位置。
+/// Ok(true)=已恢复；Ok(false)=键本就不存在，无需恢复。
+fn revert_proxy_fix_to_settings(
+    settings_path: &Path,
+    expected_written_value: &str,
+    previous_value: Option<&str>,
+    settings_existed: bool,
+    backup_display: &str,
+    write_if_unchanged: &dyn Fn(&Path, Option<&str>, &str) -> Result<bool, String>,
+) -> Result<bool, String> {
+    let content = match std::fs::read_to_string(settings_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("读取 settings.json 失败，已中止: {e}")),
+    };
+    let value = parse_settings_jsonc(&content)
+        .ok_or("settings.json 当前不是合法 JSON/JSONC，已中止")?;
+    let current = value
+        .get("http.proxy")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    match current.as_deref() {
+        None => return Ok(false),
+        Some(v) if v != expected_written_value => {
+            return Err(format!(
+                "http.proxy 当前值与本工具写入值不同（可能已被修改），拒绝自动恢复。\
+                 写入前备份位于: {backup_display}（请核对后手动还原）"
+            ));
+        }
+        _ => {}
+    }
+
+    // 目标：还原写入前状态。文件原本不存在且只剩本工具写入的键时，
+    // 删除整个文件比留下空对象更忠实。
+    let only_our_key = value
+        .as_object()
+        .map(|o| o.len() == 1 && o.contains_key("http.proxy"))
+        .unwrap_or(false);
+    if !settings_existed && only_our_key {
+        // 删文件前再读一次确认内容未被并发改动
+        let fresh = std::fs::read_to_string(settings_path)
+            .map_err(|e| format!("删除前复核读取失败，已中止: {e}"))?;
+        if fresh != content {
+            return Err("settings.json 在恢复前被其他程序修改，已中止（未做任何修改）".into());
+        }
+        std::fs::remove_file(settings_path)
+            .map_err(|e| format!("删除本工具创建的 settings.json 失败: {e}"))?;
+        if settings_path.exists() {
+            return Err("删除已提交但文件仍存在，请手动检查".into());
+        }
+        return Ok(true);
+    }
+
+    let new_content = match previous_value {
+        Some(prev) => {
+            let literal = serde_json::to_string(prev)
+                .map_err(|e| format!("序列化原代理值失败: {e}"))?;
+            jsonc_set_top_level(&content, "http.proxy", &literal)
+                .map_err(|e| format!("恢复原代理值失败，已中止: {e}"))?
+        }
+        None => jsonc_remove_top_level(&content, "http.proxy")
+            .map_err(|e| format!("移除 http.proxy 失败，已中止: {e}"))?,
+    };
+    match write_if_unchanged(settings_path, Some(&content), &new_content)? {
+        true => {}
+        false => {
+            return Err("settings.json 在恢复前被其他程序修改，已中止（未做任何修改）".into());
+        }
+    }
+    let ok = std::fs::read_to_string(settings_path)
+        .ok()
+        .and_then(|t| parse_settings_jsonc(&t))
+        .map(|v| match previous_value {
+            Some(prev) => v.get("http.proxy").and_then(|p| p.as_str()) == Some(prev),
+            None => v.get("http.proxy").is_none(),
+        })
+        .unwrap_or(false);
+    if !ok {
+        return Err(format!(
+            "恢复写入已提交但回读校验未通过。备份位于: {backup_display}"
+        ));
+    }
+    Ok(true)
+}
+
+/// 从写入前备份求证原代理值：旧版撤销记录没有 previous_value 字段，
+/// 不能把「原值未知」当成「原本没有代理」——备份能读就用备份说话，
+/// 读不出/解析不了就拒绝自动恢复，让人工核对。
+/// Ok(Some(v))=备份里确有原值；Ok(None)=备份证明原本没有该键。
+fn recover_previous_from_backup(backup_path: &str) -> Result<Option<String>, String> {
+    let text = std::fs::read_to_string(backup_path)
+        .map_err(|e| format!("读取备份失败: {e}"))?;
+    let value = parse_settings_jsonc(&text)
+        .ok_or_else(|| "备份不是合法 JSON/JSONC".to_string())?;
+    if !value.is_object() {
+        return Err("备份顶层不是 JSON 对象".into());
+    }
+    Ok(value
+        .get("http.proxy")
+        .and_then(|v| v.as_str())
+        .map(str::to_string))
+}
+
+/// 撤销主流程（可测试）：原值求证（含旧记录备份兜底）→ 核心还原 →
+/// 成功后清理状态记录。
+fn revert_with_state(
+    state: &ProxyFixState,
+    state_record_path: &Path,
+    write_if_unchanged: &dyn Fn(&Path, Option<&str>, &str) -> Result<bool, String>,
+) -> Result<ProxyFixOutcome, String> {
+    let settings_path = PathBuf::from(&state.settings_path);
+    // 原值：新记录直接带；旧记录从备份求证，求证不了就拒绝
+    let previous: Option<String> = match &state.previous_value {
+        Some(v) => Some(v.clone()),
+        None => match recover_previous_from_backup(&state.backup_path) {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(format!(
+                    "撤销记录缺少原值且备份不可读，拒绝自动恢复（{e}）。\
+                     请核对备份 {} 后手动还原",
+                    state.backup_path
+                ))
+            }
+        },
+    };
+    match revert_proxy_fix_to_settings(
+        &settings_path,
+        &state.written_value,
+        previous.as_deref(),
+        state.settings_existed,
+        &state.backup_path,
+        write_if_unchanged,
+    ) {
+        Ok(true) => {
+            let _ = std::fs::remove_file(state_record_path);
+            let restored = match &previous {
+                // 返回值直接上前端展示：原值可能含 user:pass@/查询参数，脱敏显示；
+                // 恢复动作本身仍用后端完整原值（上面的 previous）。
+                Some(v) => format!("已恢复为 {}", mask_proxy_display(v)),
+                None if state.settings_existed => "(已移除)".to_string(),
+                None => "(本工具创建的 settings.json 已删除)".to_string(),
+            };
+            Ok(ProxyFixOutcome {
+                settings_path: state.settings_path.clone(),
+                new_proxy: restored,
+                backup_path: state.backup_path.clone(),
+                legacy_nested_proxy_present: false,
+                write_verified: true,
+                state_path: String::new(),
+            })
+        }
+        Ok(false) => {
+            let _ = std::fs::remove_file(state_record_path);
+            Err("http.proxy 已不在配置中，无需恢复（记录已清除）".into())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn revert_client_proxy_fix_inner() -> Result<ProxyFixOutcome, String> {
+    let _file_guard = crate::modules::process::lock_client_operation()?;
+    crate::modules::quota_monitor::global()
+        .ensure_no_in_flight_switch()
+        .map_err(|code| crate::modules::quota_monitor::confirm_error_message(&code))?;
+    let state = load_proxy_fix_state()
+        .ok_or("没有本工具写入的代理修改记录，无法自动恢复")?;
+    revert_with_state(&state, &proxy_fix_state_path()?, &|path, expected, new_content| {
+        crate::modules::atomic_write::replace_secret_string_if_matches(
+            path,
+            expected,
+            Some(new_content),
+        )
     })
 }
 
@@ -2197,8 +3345,12 @@ pub async fn clear_stale_pac_config() -> Result<PacClearGuidance, String> {
 
 /// 恢复操作：温和重启官方客户端（正常关闭 → 等待退出 → 按原路径启动）。
 /// 不改登录态、不写任何客户端文件。前端必须在用户确认（含“已保存工作”）后调用。
+/// close_windsurf 超时只报错不强杀，取消关闭时不会启动第二实例。
 #[tauri::command]
 pub async fn restart_devin_client() -> Result<String, String> {
+    let _guard = crate::CLIENT_LOCK
+        .try_lock()
+        .map_err(|_| "正在操作客户端，请稍后再试")?;
     tokio::task::spawn_blocking(|| -> Result<String, String> {
         let _file_guard = crate::modules::process::lock_client_operation()?;
         // 若官方客户端正在处理一次 devin:// 登录，重启会打断确认弹窗
@@ -2378,14 +3530,16 @@ mod tests {
 
     #[test]
     fn parse_connection_settings_with_stale_pac_hides_secret() {
+        // flags=0x04：PAC 生效中（PROXY_TYPE_AUTO_PROXY_URL）
         let bytes = build_default_connection_settings(
-            0x02,
+            0x04,
             None,
             Some("<local>"),
             Some("http://127.0.0.1:20084/proxy.pac?secret=topsecretvalue123456&token=abc"),
         );
         let info = parse_default_connection_settings(&bytes).expect("parse");
-        assert!(info.pac_detected);
+        assert!(info.pac_configured);
+        assert!(info.pac_active);
         // PAC URL 在 bypass 之后的尾部，必须解析出 host:port
         assert_eq!(info.pac_target, Some(("127.0.0.1".to_string(), 20084)));
         assert!(info.pac_hidden_query);
@@ -2397,26 +3551,83 @@ mod tests {
     }
 
     #[test]
+    fn parse_connection_settings_manual_proxy_with_pac_residual_string() {
+        // flags=0x03（手动代理开、PAC 关）+ blob 尾部残留 PAC 字符串：
+        // 只算“配置了”，不算“生效中”——这是 reviewer 确认的误报场景
+        let bytes = build_default_connection_settings(
+            0x03,
+            Some("127.0.0.1:7897"),
+            Some("<local>"),
+            Some("http://127.0.0.1:20084/proxy.pac?secret=residualsecretvalue"),
+        );
+        let info = parse_default_connection_settings(&bytes).expect("parse");
+        assert!(info.pac_configured);
+        assert!(!info.pac_active);
+        assert_eq!(info.pac_target, Some(("127.0.0.1".to_string(), 20084)));
+        // 残留场景不得产生 confirmed_issue / stale
+        let registry = RegistryProxyInfo {
+            pac_configured: info.pac_configured,
+            pac_active: info.pac_active,
+            pac_target: info.pac_target,
+            pac_hidden_query: info.pac_hidden_query,
+            ..Default::default()
+        };
+        let (item, issue, stale) = build_pac_item(&registry, Some(false));
+        assert_eq!(item.status, CheckStatus::Ok, "{}", item.detail);
+        assert!(!issue, "未启用的 PAC 残留不得判定为 confirmed_issue");
+        assert!(!stale, "未启用的 PAC 残留不得置 stale_pac");
+        let debug = format!("{item:?}");
+        assert!(!debug.contains("residualsecret"), "{debug}");
+    }
+
+    #[test]
+    fn pac_item_active_dead_port_is_confirmed_issue() {
+        // flags=0x05（手动代理 + PAC 生效中）且 PAC 端口死：真故障
+        let bytes = build_default_connection_settings(
+            0x05,
+            Some("127.0.0.1:7897"),
+            Some("<local>"),
+            Some("http://127.0.0.1:20084/proxy.pac"),
+        );
+        let info = parse_default_connection_settings(&bytes).expect("parse");
+        assert!(info.pac_active);
+        let registry = RegistryProxyInfo {
+            pac_configured: info.pac_configured,
+            pac_active: info.pac_active,
+            pac_target: info.pac_target,
+            pac_hidden_query: info.pac_hidden_query,
+            ..Default::default()
+        };
+        let (item, issue, stale) = build_pac_item(&registry, Some(false));
+        assert_eq!(item.status, CheckStatus::ConfirmedIssue, "{}", item.detail);
+        assert!(issue);
+        assert!(stale);
+    }
+
+    #[test]
     fn parse_connection_settings_no_pac() {
         // 静态代理 + bypass，无 PAC URL、无 PAC 标志位
         let bytes = build_default_connection_settings(0x01, Some("127.0.0.1:7897"), Some("<local>"), None);
         let info = parse_default_connection_settings(&bytes).expect("parse");
-        assert!(!info.pac_detected);
+        assert!(!info.pac_configured);
+        assert!(!info.pac_active);
         assert_eq!(info.pac_target, None);
     }
 
     #[test]
-    fn parse_connection_settings_pac_flag_set_but_url_empty() {
-        // 标志位有 PAC 但 URL 为空串：不猜测目标
-        let bytes = build_default_connection_settings(0x02, None, Some("<local>"), None);
+    fn parse_connection_settings_pac_active_but_url_empty() {
+        // PAC 生效中（0x04）但 URL 为空串：不猜测目标
+        let bytes = build_default_connection_settings(0x04, None, Some("<local>"), None);
         let info = parse_default_connection_settings(&bytes).expect("parse");
+        assert!(info.pac_active);
+        assert!(!info.pac_configured);
         assert_eq!(info.pac_target, None);
     }
 
     #[test]
     fn parse_connection_settings_truncated_pac_is_rejected() {
         let mut truncated = build_default_connection_settings(
-            0x02,
+            0x04,
             Some("127.0.0.1:7897"),
             Some("<local>"),
             Some("http://127.0.0.1:20084/proxy.pac?secret=truncatedsecretvalue"),
@@ -2430,7 +3641,8 @@ mod tests {
     fn parse_connection_settings_static_proxy_only() {
         let bytes = build_default_connection_settings(0x01, Some("127.0.0.1:7897"), None, None);
         let info = parse_default_connection_settings(&bytes).expect("parse");
-        assert!(!info.pac_detected);
+        assert!(!info.pac_configured);
+        assert!(!info.pac_active);
         assert_eq!(info.pac_target, None);
     }
 
@@ -2438,10 +3650,10 @@ mod tests {
     fn parse_connection_settings_rejects_garbage() {
         assert!(parse_default_connection_settings(&[]).is_none());
         assert!(parse_default_connection_settings(&[0u8; 8]).is_none());
-        let mut bad = build_default_connection_settings(0x02, None, None, None);
+        let mut bad = build_default_connection_settings(0x04, None, None, None);
         bad[0] = 0xFF; // 未知版本
         assert!(parse_default_connection_settings(&bad).is_none());
-        let mut truncated = build_default_connection_settings(0x02, Some("127.0.0.1:7897"), None, None);
+        let mut truncated = build_default_connection_settings(0x04, Some("127.0.0.1:7897"), None, None);
         truncated.truncate(14); // 长度字段指向不存在的字节
         assert!(parse_default_connection_settings(&truncated).is_none());
     }
@@ -2503,6 +3715,18 @@ mod tests {
 
     // ---- apply_client_proxy_fix 写逻辑（临时目录，不触真实环境） ----
 
+    #[test]
+    fn ineffective_item_is_unknown_with_uncertainty_wording() {
+        let item = build_ineffective_item(&[7897]);
+        assert_eq!(item.id, "proxy.ineffective");
+        assert_eq!(item.status, CheckStatus::Unknown, "不得升级为 confirmed_issue");
+        assert_eq!(item.title, "可能存在代理问题，待对照验证");
+        assert!(item.detail.contains("不构成已确认的故障"), "{}", item.detail);
+        assert!(item.detail.contains("TUN"), "{}", item.detail);
+        assert!(item.detail.contains("对照验证"), "{}", item.detail);
+        assert!(!item.detail.contains("必须重启"));
+    }
+
     fn temp_case_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2522,34 +3746,146 @@ mod tests {
         crate::modules::atomic_write::write_string_atomic(path, content)
     }
 
+    /// 与 replace_secret_string_if_matches 同语义的测试写入口。
+    fn cond_write_fn(path: &Path, expected: Option<&str>, content: &str) -> Result<bool, String> {
+        let current = std::fs::read_to_string(path).ok();
+        if current.as_deref() != expected {
+            return Ok(false);
+        }
+        atomic_write_fn(path, content)?;
+        Ok(true)
+    }
+
     #[test]
     fn proxy_fix_creates_backup_and_preserves_other_fields() {
         let dir = temp_case_dir("preserve");
         let settings = dir.join("settings.json");
         let backup = dir.join("backups").join("backup.json");
-        let original = r#"{"http":{"proxy":"http://127.0.0.1:1","proxyStrictSSL":false},"editor":{"fontSize":14},"tokens":["a","b"]}"#;
+        let state = dir.join("proxy-fix-state.json");
+        // VS Code 扁平键形态
+        let original = r#"{"http.proxy":"http://127.0.0.1:1","http.proxyStrictSSL":false,"editor":{"fontSize":14},"tokens":["a","b"]}"#;
         atomic_write_fn(&settings, original).unwrap();
 
         let outcome =
-            apply_proxy_fix_to_settings(7897, &settings, &backup, &atomic_write_fn).unwrap();
+            apply_proxy_fix_to_settings(7897, &settings, &backup, &state, &cond_write_fn).unwrap();
         assert_eq!(outcome.new_proxy, "http://127.0.0.1:7897");
+        assert!(outcome.write_verified);
+        assert!(!outcome.legacy_nested_proxy_present);
 
         let new_content = std::fs::read_to_string(&settings).unwrap();
         let value: serde_json::Value = serde_json::from_str(&new_content).unwrap();
-        assert_eq!(value["http"]["proxy"], "http://127.0.0.1:7897");
+        assert_eq!(value["http.proxy"], "http://127.0.0.1:7897");
         // 其余字段内容不丢
-        assert_eq!(value["http"]["proxyStrictSSL"], false);
+        assert_eq!(value["http.proxyStrictSSL"], false);
         assert_eq!(value["editor"]["fontSize"], 14);
         assert_eq!(value["tokens"], serde_json::json!(["a", "b"]));
+        // 局部编辑：除被替换的值外，原文逐字节保留
+        assert!(new_content.contains("\"editor\":{\"fontSize\":14}"), "{new_content}");
 
         // 备份等于原文件内容
         let backup_content = std::fs::read_to_string(&backup).unwrap();
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&backup_content).unwrap(),
-            serde_json::from_str::<serde_json::Value>(original).unwrap()
-        );
+        assert_eq!(backup_content, original);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proxy_fix_writes_flat_key_and_keeps_nested_miswrite() {
+        let dir = temp_case_dir("keep-nested");
+        let settings = dir.join("settings.json");
+        let backup = dir.join("backups").join("backup.json");
+        let state = dir.join("proxy-fix-state.json");
+        // 旧版误写的嵌套形式（可能还混有其他 http.* 键）：
+        // 不自动删除、不猜测来源，仅提示
+        let original = r#"{"http":{"proxy":"http://127.0.0.1:1","proxySupport":"override"},"editor.fontSize":14}"#;
+        atomic_write_fn(&settings, original).unwrap();
+
+        let outcome =
+            apply_proxy_fix_to_settings(7899, &settings, &backup, &state, &cond_write_fn).unwrap();
+        assert!(outcome.legacy_nested_proxy_present);
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(value["http.proxy"], "http://127.0.0.1:7899");
+        // 嵌套字段原样保留（含壳内其他键）
+        assert_eq!(value["http"]["proxy"], "http://127.0.0.1:1");
+        assert_eq!(value["http"]["proxySupport"], "override");
+        assert_eq!(value["editor.fontSize"], 14);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proxy_fix_preserves_comments_and_other_keys() {
+        let dir = temp_case_dir("jsonc");
+        let settings = dir.join("settings.json");
+        let backup = dir.join("backups").join("backup.json");
+        let state = dir.join("proxy-fix-state.json");
+        let original = "{\n  // 用户代理设置\n  \"http.proxy\": \"http://127.0.0.1:1\",\n  /* 块注释 */\n  \"editor.fontSize\": 14, // 行尾注释\n  \"tokens\": [\"a\", \"b\",],\n}\n";
+        atomic_write_fn(&settings, original).unwrap();
+
+        let outcome =
+            apply_proxy_fix_to_settings(7800, &settings, &backup, &state, &cond_write_fn).unwrap();
+        assert!(outcome.write_verified);
+
+        // 注释 / 尾逗号 / 其他键原样保留，仅 http.proxy 值被替换
+        let new_content = std::fs::read_to_string(&settings).unwrap();
+        assert!(new_content.contains("// 用户代理设置"), "{new_content}");
+        assert!(new_content.contains("/* 块注释 */"), "{new_content}");
+        assert!(new_content.contains("// 行尾注释"), "{new_content}");
+        assert!(new_content.contains("[\"a\", \"b\",]"), "{new_content}");
+        let value = parse_settings_jsonc(&new_content).expect("JSONC 仍可解析");
+        assert_eq!(value["http.proxy"], "http://127.0.0.1:7800");
+        assert_eq!(value["editor.fontSize"], 14);
+        assert_eq!(value["tokens"], serde_json::json!(["a", "b"]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_devin_proxy_settings_reads_flat_key_and_jsonc() {
+        let dir = temp_case_dir("read-flat");
+        let settings = dir.join("settings.json");
+        let content = "{\n  // 注释\n  \"http.proxy\": \"http://127.0.0.1:7897\", // 尾逗号下一行\n  \"devin.acp.agentEnv\": {\"HTTPS_PROXY\": \"http://user:pass@127.0.0.1:7897\"},\n}\n";
+        atomic_write_fn(&settings, content).unwrap();
+
+        let parsed = read_devin_proxy_settings(&settings);
+        assert!(!parsed.parse_error, "JSONC 应能解析");
+        assert_eq!(parsed.http_proxy.as_deref(), Some("http://127.0.0.1:7897"));
+        // agentEnv 只列键名/主机端口，不回传凭据
+        assert_eq!(parsed.agent_env_keys, vec!["HTTPS_PROXY=127.0.0.1:7897".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_devin_proxy_settings_nested_fallback() {
+        let dir = temp_case_dir("read-nested");
+        let settings = dir.join("settings.json");
+        // 旧版误写的嵌套形式：读取侧兼容
+        atomic_write_fn(
+            &settings,
+            r#"{"http":{"proxy":"http://127.0.0.1:9"}}"#,
+        )
+        .unwrap();
+
+        let parsed = read_devin_proxy_settings(&settings);
+        assert!(!parsed.parse_error);
+        assert_eq!(parsed.http_proxy.as_deref(), Some("http://127.0.0.1:9"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jsonc_preprocess_protects_strings() {
+        let cleaned = strip_jsonc(
+            r#"{"url": "http://example.com/a//b", "s": "/*not comment*/", "list": [1,], /* real */ "x": 1}"#,
+        );
+        let value: serde_json::Value = serde_json::from_str(&cleaned).expect("预处理结果应可解析");
+        assert_eq!(value["url"], "http://example.com/a//b");
+        assert_eq!(value["s"], "/*not comment*/");
+        assert_eq!(value["list"], serde_json::json!([1]));
+        assert_eq!(value["x"], 1);
     }
 
     #[test]
@@ -2557,14 +3893,16 @@ mod tests {
         let dir = temp_case_dir("create");
         let settings = dir.join("User").join("settings.json");
         let backup = dir.join("backups").join("backup.json");
+        let state = dir.join("proxy-fix-state.json");
 
         let outcome =
-            apply_proxy_fix_to_settings(7890, &settings, &backup, &atomic_write_fn).unwrap();
+            apply_proxy_fix_to_settings(7890, &settings, &backup, &state, &cond_write_fn).unwrap();
         assert_eq!(outcome.new_proxy, "http://127.0.0.1:7890");
+        assert!(outcome.write_verified);
 
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(value["http"]["proxy"], "http://127.0.0.1:7890");
+        assert_eq!(value["http.proxy"], "http://127.0.0.1:7890");
         assert_eq!(value.as_object().unwrap().len(), 1, "只应新增 http.proxy");
         // 占位备份
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), "{}");
@@ -2573,32 +3911,67 @@ mod tests {
     }
 
     #[test]
-    fn proxy_fix_rolls_back_original_content_on_write_failure() {
+    fn proxy_fix_write_failure_leaves_original_untouched() {
         let dir = temp_case_dir("rollback");
         let settings = dir.join("settings.json");
         let backup = dir.join("backups").join("backup.json");
-        let original = r#"{"http":{"proxy":"http://127.0.0.1:1"},"editor":{"fontSize":14}}"#;
+        let state = dir.join("proxy-fix-state.json");
+        let original = r#"{"http.proxy":"http://127.0.0.1:1","editor.fontSize":14}"#;
         atomic_write_fn(&settings, original).unwrap();
 
-        // 首次写 settings 时模拟失败，回退时写入必须成功
-        let attempts = std::cell::Cell::new(0u32);
-        let writer = |path: &Path, content: &str| -> Result<(), String> {
-            if path == settings.as_path() {
-                let n = attempts.get() + 1;
-                attempts.set(n);
-                if n == 1 {
-                    return Err("模拟首次写入失败".into());
-                }
-            }
-            atomic_write_fn(path, content)
+        // 条件写返回 Err：原子写全有或全无，原文件未被改动
+        let writer = |_path: &Path, _expected: Option<&str>, _c: &str| -> Result<bool, String> {
+            Err("模拟写入失败".into())
         };
 
-        let err = apply_proxy_fix_to_settings(7897, &settings, &backup, &writer)
+        let err = apply_proxy_fix_to_settings(7897, &settings, &backup, &state, &writer)
             .expect_err("写入失败必须返回 Err");
-        assert!(err.contains("已恢复原内容"), "{err}");
-        // 原文件内容未被破坏，备份也已创建
+        assert!(err.contains("写入 settings.json 失败"), "{err}");
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), original);
-        assert!(backup.is_file());
+        assert!(backup.is_file(), "备份仍应已创建");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proxy_fix_aborts_when_file_changed_concurrently() {
+        let dir = temp_case_dir("concurrent");
+        let settings = dir.join("settings.json");
+        let backup = dir.join("backups").join("backup.json");
+        let state = dir.join("proxy-fix-state.json");
+        let original = r#"{"http.proxy":"http://127.0.0.1:1"}"#;
+        atomic_write_fn(&settings, original).unwrap();
+
+        // 条件写检测到内容变化 → Ok(false) → 必须中止且不得声称已写入
+        let writer = |_path: &Path, _expected: Option<&str>, _c: &str| -> Result<bool, String> {
+            Ok(false)
+        };
+
+        let err = apply_proxy_fix_to_settings(7897, &settings, &backup, &state, &writer)
+            .expect_err("并发修改必须中止");
+        assert!(err.contains("被其他程序修改"), "{err}");
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), original);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn proxy_fix_aborts_when_post_write_verify_fails() {
+        let dir = temp_case_dir("verify-fail");
+        let settings = dir.join("settings.json");
+        let backup = dir.join("backups").join("backup.json");
+        let state = dir.join("proxy-fix-state.json");
+        atomic_write_fn(&settings, r#"{"a":1}"#).unwrap();
+
+        // 写入口声称成功但实际写入了别的内容 → 回读校验必须抓出来
+        let writer = |path: &Path, _e: Option<&str>, _c: &str| -> Result<bool, String> {
+            atomic_write_fn(path, r#"{"http.proxy":"http://127.0.0.1:9999"}"#)?;
+            Ok(true)
+        };
+
+        let err = apply_proxy_fix_to_settings(7897, &settings, &backup, &state, &writer)
+            .expect_err("回读不一致必须报错");
+        assert!(err.contains("回读校验未通过"), "{err}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2608,15 +3981,568 @@ mod tests {
         let dir = temp_case_dir("invalid-json");
         let settings = dir.join("settings.json");
         let backup = dir.join("backups").join("backup.json");
+        let state = dir.join("proxy-fix-state.json");
         atomic_write_fn(&settings, "{not valid json").unwrap();
 
-        let err = apply_proxy_fix_to_settings(7897, &settings, &backup, &atomic_write_fn)
+        let err = apply_proxy_fix_to_settings(7897, &settings, &backup, &state, &cond_write_fn)
             .expect_err("非法 JSON 必须中止");
         assert!(err.contains("不是合法 JSON"), "{err}");
         assert!(!backup.exists(), "中止时不得创建备份");
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), "{not valid json");
 
+        // 未闭合的块注释：预处理后仍非法，也必须中止
+        atomic_write_fn(&settings, "{\"a\": 1, /* 未闭合").unwrap();
+        let err = apply_proxy_fix_to_settings(7897, &settings, &backup, &state, &cond_write_fn)
+            .expect_err("非法 JSONC 必须中止");
+        assert!(err.contains("不是合法 JSON"), "{err}");
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- JSONC 局部编辑 ----
+
+    #[test]
+    fn jsonc_set_replaces_existing_value_only() {
+        let text = r#"{"http.proxy": "old", "a": 1, "url": "http://x//y"}"#;
+        let out = jsonc_set_top_level(text, "http.proxy", "\"new\"").unwrap();
+        assert_eq!(out, r#"{"http.proxy": "new", "a": 1, "url": "http://x//y"}"#);
+    }
+
+    #[test]
+    fn jsonc_set_inserts_before_first_member_with_indent() {
+        let text = "{\n    \"editor.fontSize\": 14,\n    \"a\": 1\n}";
+        let out = jsonc_set_top_level(text, "http.proxy", "\"v\"").unwrap();
+        assert_eq!(
+            out,
+            "{\n    \"http.proxy\": \"v\",\n    \"editor.fontSize\": 14,\n    \"a\": 1\n}"
+        );
+    }
+
+    #[test]
+    fn jsonc_set_into_empty_and_compact_objects() {
+        assert_eq!(
+            jsonc_set_top_level("{}", "http.proxy", "\"v\"").unwrap(),
+            "{ \"http.proxy\": \"v\" }"
+        );
+        let out = jsonc_set_top_level("{\"a\":1}", "http.proxy", "\"v\"").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["http.proxy"], "v");
+        assert_eq!(v["a"], 1);
+    }
+
+    #[test]
+    fn jsonc_remove_members_at_edges() {
+        // 首成员
+        let out = jsonc_remove_top_level("{\"http.proxy\":\"v\",\"a\":1}", "http.proxy").unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&out).unwrap()["a"], 1);
+        assert!(!out.contains("http.proxy"));
+        // 末成员（带走前逗号）
+        let out = jsonc_remove_top_level("{\"a\":1,\"http.proxy\":\"v\"}", "http.proxy").unwrap();
+        assert_eq!(out, "{\"a\":1}");
+        // 中间成员
+        let out = jsonc_remove_top_level("{\"a\":1,\"http.proxy\":\"v\",\"b\":2}", "http.proxy").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["a"], 1);
+        assert_eq!(v["b"], 2);
+        // 唯一成员
+        let out = jsonc_remove_top_level("{\"http.proxy\":\"v\"}", "http.proxy").unwrap();
+        assert!(!out.contains("http.proxy"));
+        // 不存在的键 → 原样返回
+        let out = jsonc_remove_top_level("{\"a\":1}", "http.proxy").unwrap();
+        assert_eq!(out, "{\"a\":1}");
+    }
+
+    #[test]
+    fn jsonc_members_skip_comments_and_strings() {
+        // 注释里的 "http.proxy" 和字符串里的引号不得误判为成员
+        let text = "{\n  // \"http.proxy\": \"fake\"\n  \"a\": \"{\\\"http.proxy\\\":1}\",\n  \"http.proxy\": \"v\"\n}";
+        let members = jsonc_top_level_members(text).unwrap();
+        let keys: Vec<&str> = members.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys, vec!["a", "http.proxy"]);
+    }
+
+    // ---- HTTP CONNECT 代理握手 ----
+
+    fn fake_proxy_once(response: &'static str) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::{Read, Write};
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn proxy_probe_accepts_2xx_connect_response() {
+        let port = fake_proxy_once("HTTP/1.1 200 Connection established\r\n\r\n");
+        assert!(probe_http_connect_proxy(port).is_ok());
+    }
+
+    #[test]
+    fn proxy_probe_flags_auth_required_on_407() {
+        let port = fake_proxy_once("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n");
+        assert_eq!(probe_http_connect_proxy(port), Err(ProxyProbeError::AuthRequired));
+    }
+
+    #[test]
+    fn proxy_probe_rejects_non_proxy_port() {
+        let port = fake_proxy_once("not-an-http-response");
+        assert_eq!(probe_http_connect_proxy(port), Err(ProxyProbeError::NotHttpProxy));
+    }
+
+    #[test]
+    fn proxy_probe_refused_when_nothing_listens() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert_eq!(probe_http_connect_proxy(port), Err(ProxyProbeError::Refused));
+    }
+
+    #[test]
+    fn proxy_probe_silent_port_is_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((_s, _)) = listener.accept() {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+            }
+        });
+        assert_eq!(probe_http_connect_proxy(port), Err(ProxyProbeError::Timeout));
+    }
+
+    // ---- 恢复本次代理修改 ----
+
+    #[test]
+    fn revert_restores_when_value_matches() {
+        let dir = temp_case_dir("revert-ok");
+        let settings = dir.join("settings.json");
+        atomic_write_fn(&settings, "{\n  \"http.proxy\": \"http://127.0.0.1:7897\",\n  \"a\": 1\n}").unwrap();
+        let reverted = revert_proxy_fix_to_settings(
+            &settings, "http://127.0.0.1:7897", None, true, "B", &cond_write_fn).unwrap();
+        assert!(reverted);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(v.get("http.proxy").is_none());
+        assert_eq!(v["a"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revert_refuses_when_value_changed_by_user() {
+        let dir = temp_case_dir("revert-conflict");
+        let settings = dir.join("settings.json");
+        atomic_write_fn(&settings, "{\"http.proxy\":\"http://127.0.0.1:9999\"}").unwrap();
+        let err = revert_proxy_fix_to_settings(
+            &settings, "http://127.0.0.1:7897", None, true, "B", &cond_write_fn).unwrap_err();
+        assert!(err.contains("拒绝自动恢复"), "{err}");
+        assert!(err.contains('B'), "{err}");
+        // 文件未被改动
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "{\"http.proxy\":\"http://127.0.0.1:9999\"}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revert_noop_when_key_absent() {
+        let dir = temp_case_dir("revert-absent");
+        let settings = dir.join("settings.json");
+        atomic_write_fn(&settings, "{\"a\":1}").unwrap();
+        let reverted = revert_proxy_fix_to_settings(
+            &settings, "x", None, true, "B", &cond_write_fn).unwrap();
+        assert!(!reverted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revert_restores_previous_proxy_value_not_deletes() {
+        // 原配置 http.proxy=7890，修复写成 7897：撤销必须恢复 7890，
+        // 不能变成"没有代理"。这是审查指出的核心场景。
+        let dir = temp_case_dir("revert-restore");
+        let settings = dir.join("settings.json");
+        atomic_write_fn(&settings, "{\n  \"http.proxy\": \"http://127.0.0.1:7897\",\n  \"a\": 1\n}").unwrap();
+        let reverted = revert_proxy_fix_to_settings(
+            &settings, "http://127.0.0.1:7897", Some("http://127.0.0.1:7890"), true, "B", &cond_write_fn,
+        ).unwrap();
+        assert!(reverted);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["http.proxy"], "http://127.0.0.1:7890", "必须恢复原端口");
+        assert_eq!(v["a"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revert_deletes_settings_file_when_tool_created_it() {
+        // 文件原本不存在（本工具创建）：恢复后应回到"没有该文件"的状态
+        let dir = temp_case_dir("revert-del-file");
+        let settings = dir.join("settings.json");
+        atomic_write_fn(&settings, "{\n  \"http.proxy\": \"http://127.0.0.1:7897\"\n}\n").unwrap();
+        let reverted = revert_proxy_fix_to_settings(
+            &settings, "http://127.0.0.1:7897", None, false, "B", &cond_write_fn,
+        ).unwrap();
+        assert!(reverted);
+        assert!(!settings.exists(), "本工具创建的文件应被删除还原");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn revert_removes_key_keeps_file_when_user_added_keys() {
+        // 文件原本不存在但用户后来加了其他设置：只移除我们的键，保留文件
+        let dir = temp_case_dir("revert-keep-file");
+        let settings = dir.join("settings.json");
+        atomic_write_fn(&settings, "{\n  \"http.proxy\": \"http://127.0.0.1:7897\",\n  \"editor.fontSize\": 15\n}\n").unwrap();
+        let reverted = revert_proxy_fix_to_settings(
+            &settings, "http://127.0.0.1:7897", None, false, "B", &cond_write_fn,
+        ).unwrap();
+        assert!(reverted);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(v.get("http.proxy").is_none());
+        assert_eq!(v["editor.fontSize"], 15, "用户后加的设置必须保留");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_persists_state_so_revert_restores_original() {
+        // 端到端：apply 在改配置前落盘撤销记录 → revert 凭记录恢复原端口
+        let dir = temp_case_dir("roundtrip");
+        let settings = dir.join("settings.json");
+        let backup = dir.join("backups").join("backup.json");
+        let state = dir.join("proxy-fix-state.json");
+        atomic_write_fn(&settings, "{\"http.proxy\":\"http://127.0.0.1:7890\",\"a\":1}").unwrap();
+
+        let outcome = apply_proxy_fix_to_settings(7897, &settings, &backup, &state, &cond_write_fn).unwrap();
+        assert_eq!(outcome.new_proxy, "http://127.0.0.1:7897");
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        assert_eq!(saved["writtenValue"], "http://127.0.0.1:7897");
+        assert_eq!(saved["previousValue"], "http://127.0.0.1:7890");
+        assert_eq!(saved["settingsExisted"], true);
+
+        // 模拟用户又加了别的设置后执行撤销：原端口恢复、新设置保留
+        atomic_write_fn(&settings, "{\"http.proxy\":\"http://127.0.0.1:7897\",\"a\":1,\"new.key\":true}").unwrap();
+        let reverted = revert_proxy_fix_to_settings(
+            &settings,
+            saved["writtenValue"].as_str().unwrap(),
+            saved["previousValue"].as_str(),
+            saved["settingsExisted"].as_bool().unwrap(),
+            "B",
+            &cond_write_fn,
+        ).unwrap();
+        assert!(reverted);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["http.proxy"], "http://127.0.0.1:7890");
+        assert_eq!(v["new.key"], true, "撤销期间用户新增的设置必须保留");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_aborts_when_state_record_unwritable() {
+        // 撤销记录写不进去 → 直接中止，不制造"改了没法还原"的部分成功
+        let dir = temp_case_dir("state-fail");
+        let settings = dir.join("settings.json");
+        let backup = dir.join("backups").join("backup.json");
+        let blocker = dir.join("blocker");
+        atomic_write_fn(&settings, "{\"a\":1}").unwrap();
+        atomic_write_fn(&blocker, "file").unwrap();
+        let state = blocker.join("child").join("state.json");
+        let err = apply_proxy_fix_to_settings(7897, &settings, &backup, &state, &cond_write_fn)
+            .expect_err("状态记录失败必须中止");
+        assert!(err.contains("记录") || err.contains("中止"), "{err}");
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), "{\"a\":1}", "配置不得被改动");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_refuses_when_unreverted_record_exists() {
+        // 已有未撤销记录时禁止再写：否则覆盖会丢掉上一次的还原凭据；
+        // 失败清理也只允许删本次创建的记录（前置拒绝保证这一点）。
+        let dir = temp_case_dir("reapply-blocked");
+        let settings = dir.join("settings.json");
+        let backup = dir.join("backups").join("backup.json");
+        let state = dir.join("proxy-fix-state.json");
+        atomic_write_fn(&settings, "{\"http.proxy\":\"http://127.0.0.1:7897\",\"a\":1}").unwrap();
+        // 上一次修改留下的记录（写 7897，原值 7890）
+        atomic_write_fn(&state, "{\"writtenValue\":\"http://127.0.0.1:7897\",\"previousValue\":\"http://127.0.0.1:7890\",\"settingsExisted\":true}").unwrap();
+
+        let err = apply_proxy_fix_to_settings(7898, &settings, &backup, &state, &cond_write_fn)
+            .expect_err("存在未撤销记录必须拒绝");
+        assert!(err.contains("先撤销") || err.contains("未撤销"), "{err}");
+        // 配置与旧记录都原样保留
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(),
+            "{\"http.proxy\":\"http://127.0.0.1:7897\",\"a\":1}");
+        assert!(std::fs::read_to_string(&state).unwrap().contains("7890"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_record_recovers_previous_value_from_backup() {
+        // 旧版撤销记录没有 previousValue 字段：必须从当时备份求证原值
+        let dir = temp_case_dir("legacy-restore");
+        let settings = dir.join("settings.json");
+        let backup = dir.join("backups").join("backup.json");
+        let state_path = dir.join("proxy-fix-state.json");
+        atomic_write_fn(&settings, "{\"http.proxy\":\"http://127.0.0.1:7897\",\"a\":1}").unwrap();
+        // 备份证明写入前是 7890
+        atomic_write_fn(&backup, "{\"http.proxy\":\"http://127.0.0.1:7890\",\"a\":1}").unwrap();
+        let legacy: ProxyFixState = serde_json::from_str(&format!(
+            "{{\"writtenValue\":\"http://127.0.0.1:7897\",\"settingsPath\":\"{}\",\"backupPath\":\"{}\",\"writtenAtMs\":1,\"appVersion\":\"0.0.0\"}}",
+            settings.to_string_lossy().replace('\\', "\\\\"),
+            backup.to_string_lossy().replace('\\', "\\\\")
+        )).unwrap();
+        assert!(legacy.previous_value.is_none() && legacy.settings_existed);
+
+        let outcome = revert_with_state(&legacy, &state_path, &cond_write_fn).unwrap();
+        assert!(outcome.new_proxy.contains("7890"), "{}", outcome.new_proxy);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["http.proxy"], "http://127.0.0.1:7890", "必须从备份恢复原值");
+        assert!(!state_path.exists(), "恢复成功后记录应清除");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_record_unreadable_backup_refuses() {
+        // 旧记录无原值 + 备份不可读 → 拒绝自动恢复，不做"当作没有"的猜测
+        let dir = temp_case_dir("legacy-nobackup");
+        let settings = dir.join("settings.json");
+        let state_path = dir.join("proxy-fix-state.json");
+        atomic_write_fn(&settings, "{\"http.proxy\":\"http://127.0.0.1:7897\"}").unwrap();
+        let legacy: ProxyFixState = serde_json::from_str(&format!(
+            "{{\"writtenValue\":\"http://127.0.0.1:7897\",\"settingsPath\":\"{}\",\"backupPath\":\"{}\",\"writtenAtMs\":1,\"appVersion\":\"0.0.0\"}}",
+            settings.to_string_lossy().replace('\\', "\\\\"),
+            dir.join("missing-backup.json").to_string_lossy().replace('\\', "\\\\")
+        )).unwrap();
+
+        let err = revert_with_state(&legacy, &state_path, &cond_write_fn).unwrap_err();
+        assert!(err.contains("拒绝自动恢复"), "{err}");
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(),
+            "{\"http.proxy\":\"http://127.0.0.1:7897\"}", "拒绝时不得改动配置");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_record_empty_backup_proves_no_previous() {
+        // 旧记录无原值但备份可读且确无该键 → 移除键是忠实还原
+        let dir = temp_case_dir("legacy-noprev");
+        let settings = dir.join("settings.json");
+        let backup = dir.join("backups").join("backup.json");
+        let state_path = dir.join("proxy-fix-state.json");
+        atomic_write_fn(&settings, "{\"http.proxy\":\"http://127.0.0.1:7897\",\"a\":1}").unwrap();
+        atomic_write_fn(&backup, "{\"a\":1}").unwrap();
+        let legacy: ProxyFixState = serde_json::from_str(&format!(
+            "{{\"writtenValue\":\"http://127.0.0.1:7897\",\"settingsPath\":\"{}\",\"backupPath\":\"{}\",\"writtenAtMs\":1,\"appVersion\":\"0.0.0\"}}",
+            settings.to_string_lossy().replace('\\', "\\\\"),
+            backup.to_string_lossy().replace('\\', "\\\\")
+        )).unwrap();
+
+        let outcome = revert_with_state(&legacy, &state_path, &cond_write_fn).unwrap();
+        assert_eq!(outcome.new_proxy, "(已移除)");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(v.get("http.proxy").is_none() && v["a"] == 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn state_info_masks_credentials_in_previous_value() {
+        // 原代理值可能带 user:pass@ 或查询参数：给前端的必须脱敏
+        let state = ProxyFixState {
+            written_value: "http://127.0.0.1:7897".into(),
+            previous_value: Some("http://user:secretpass@proxy.local:8888?key=abc".into()),
+            settings_existed: true,
+            settings_path: "C:\\s\\settings.json".into(),
+            backup_path: "C:\\s\\backup.json".into(),
+            written_at_ms: 1,
+            app_version: "0.0.0".into(),
+        };
+        let info = state_info(&state);
+        let prev = info.previous_value.unwrap();
+        assert!(!prev.contains("secretpass"), "密码泄漏: {prev}");
+        assert!(!prev.contains("key=abc"), "查询参数泄漏: {prev}");
+        assert!(prev.contains("***"), "{prev}");
+        // 恢复用的完整值仍留在 state，不受展示脱敏影响
+        assert!(state.previous_value.unwrap().contains("secretpass"));
+    }
+
+    #[test]
+    fn revert_outcome_masks_credentials_but_restores_full_value() {
+        // 原代理值带 user:pass@：配置必须恢复完整原值，
+        // 但返回给前端的 new_proxy 不得含密码。
+        let dir = temp_case_dir("revert-masked");
+        let settings = dir.join("settings.json");
+        let backup = dir.join("backups").join("backup.json");
+        let state_path = dir.join("proxy-fix-state.json");
+        let secret = "http://alice:s3cret-pass@proxy.local:8888";
+        atomic_write_fn(&settings, "{\"http.proxy\":\"http://127.0.0.1:7897\",\"a\":1}").unwrap();
+        atomic_write_fn(&backup, &format!("{{\"http.proxy\":\"{secret}\",\"a\":1}}")).unwrap();
+        let legacy: ProxyFixState = serde_json::from_str(&format!(
+            "{{\"writtenValue\":\"http://127.0.0.1:7897\",\"settingsPath\":\"{}\",\"backupPath\":\"{}\",\"writtenAtMs\":1,\"appVersion\":\"0.0.0\"}}",
+            settings.to_string_lossy().replace('\\', "\\\\"),
+            backup.to_string_lossy().replace('\\', "\\\\")
+        )).unwrap();
+
+        let outcome = revert_with_state(&legacy, &state_path, &cond_write_fn).unwrap();
+        // 序列化返回体不得含密码；展示值带脱敏标记
+        let json = serde_json::to_string(&outcome).unwrap();
+        assert!(!json.contains("s3cret-pass"), "返回体泄漏密码: {json}");
+        assert!(outcome.new_proxy.contains("***"), "{}", outcome.new_proxy);
+        // 配置文件里恢复的是完整原值
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["http.proxy"], secret, "配置必须恢复完整原值");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_cleans_state_record_when_settings_write_fails() {
+        // 配置写入失败 → 撤销记录同步清理，不留假记录
+        let dir = temp_case_dir("state-clean");
+        let settings = dir.join("settings.json");
+        let backup = dir.join("backups").join("backup.json");
+        let state = dir.join("proxy-fix-state.json");
+        atomic_write_fn(&settings, "{\"a\":1}").unwrap();
+        let err = apply_proxy_fix_to_settings(
+            7897, &settings, &backup, &state,
+            &|_p, _e, _c| -> Result<bool, String> { Err("disk full".into()) },
+        ).expect_err("写入失败");
+        assert!(err.contains("写入"), "{err}");
+        assert!(!state.exists(), "写入失败不得留下撤销记录");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn feedback_append_and_report_section() {
+        let dir = temp_case_dir("feedback");
+        let path = dir.join("recovery-feedback.json");
+        append_recovery_feedback(&path, "confirmed").unwrap();
+        append_recovery_feedback(&path, "unresolved").unwrap();
+        let list: Vec<RecoveryFeedback> =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(list.len(), 2);
+        let md = feedback_section_md(&list);
+        assert!(md.contains("已显示且消息正常") && md.contains("仍未恢复"), "{md}");
+        assert!(feedback_section_md(&[]).contains("尚无"), "无记录须如实说明");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- 失败分类 ----
+
+    #[test]
+    fn classify_failure_line_categories() {
+        assert_eq!(classify_failure_line("Team settings refresh failed: request timed out"), "network_timeout");
+        assert_eq!(classify_failure_line("request failed 401"), "auth_failed");
+        assert_eq!(classify_failure_line("status 403 Forbidden"), "auth_failed");
+        assert_eq!(classify_failure_line("open file: EACCES permission denied"), "permission");
+        assert_eq!(classify_failure_line("remote config revalidation failed"), "config");
+        assert_eq!(classify_failure_line("something weird happened"), "unknown");
+    }
+
+    #[test]
+    fn proxy_fix_aborts_when_backup_path_unwritable() {
+        let dir = temp_case_dir("backup-fail");
+        let settings = dir.join("settings.json");
+        let blocker = dir.join("blocker");
+        let original = r#"{"a":1}"#;
+        atomic_write_fn(&settings, original).unwrap();
+        atomic_write_fn(&blocker, "file").unwrap();
+        // 备份路径的父目录落在一个已存在的文件上 → 建目录/写备份必失败
+        let backup = blocker.join("child").join("backup.json");
+        let state = dir.join("proxy-fix-state.json");
+        let err = apply_proxy_fix_to_settings(7897, &settings, &backup, &state, &cond_write_fn).unwrap_err();
+        assert!(err.contains("备份") || err.contains("中止"), "{err}");
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), original, "备份失败不得改动原文件");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn minimal_diagnostics_result() -> DiagnosticsResult {
+        DiagnosticsResult {
+            generated_at_ms: 1_760_000_000_000,
+            app_version: "0.0.0-test".into(),
+            items: vec![DiagnosticItem::new(
+                "t.secret",
+                "test",
+                "含敏感证据的检查项",
+                CheckStatus::Unknown,
+                "detail".into(),
+            )
+            .with_evidence([
+                "Authorization: Bearer abcdef1234567890abcdef".to_string(),
+                "email=user@example.com".to_string(),
+            ])],
+            client: ClientDiagnostics {
+                exe_path: Some("C:\\Devin\\Devin.exe".into()),
+                exe_exists: true,
+                product_version: Some("1.0.0".into()),
+                product_commit: None,
+                file_version: None,
+                data_dir: Some("C:\\Users\\tester\\AppData\\Roaming\\Devin".into()),
+                data_dir_exists: true,
+                user_settings_exists: true,
+                cli_log_dir_exists: true,
+                ide_processes_running: 1,
+                agent_processes_running: 0,
+                acp_reload_available: true,
+                acp_reconnect_available: false,
+            },
+            proxy: ProxySection {
+                system_proxy_enabled: false,
+                system_proxy_server: None,
+                system_proxy_listening: None,
+                pac_configured: false,
+                pac_active: false,
+                pac_target: None,
+                pac_listening: None,
+                env_proxies: vec![],
+                devin_settings_proxy: Some("http://127.0.0.1:7897?secret=QUERYSECRET123".into()),
+                devin_agent_env_keys: vec![],
+                confirmed_proxy_issue: false,
+                stale_pac_confirmed: false,
+                ineffective_proxy_confirmed: false,
+                listening_local_ports: vec![],
+            },
+            network: vec![],
+            logs: LogDiagnostics {
+                log_dir: "C:\\logs".into(),
+                total_log_files: 0,
+                logs_examined: 0,
+                agent_starts: 0,
+                authenticate_attempts: 0,
+                authenticate_with_credentials: 0,
+                team_settings_failures: 0,
+                timeout_failures: 0,
+                zdr_timeouts: 0,
+                remote_config_failures: 0,
+                last_failure_at: None,
+                agent_versions: vec![],
+                running_agent_pids: vec![],
+                running_agents_authenticated: None,
+                newest_log_has_auth_failure: false,
+                failure_categories: vec![],
+            },
+            summary: SummarySection {
+                category: "测试".into(),
+                confidence: "低".into(),
+                overview: "token=SECRETTOKEN000000000000000".into(),
+                recommended_fixes: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn report_output_is_redacted_end_to_end() {
+        let md = render_markdown_report(&minimal_diagnostics_result());
+        assert!(!md.contains("abcdef1234567890abcdef"), "Bearer 泄漏:\n{md}");
+        assert!(!md.contains("user@example.com"), "邮箱泄漏:\n{md}");
+        assert!(!md.contains("QUERYSECRET123"), "查询参数泄漏:\n{md}");
+        assert!(!md.contains("SECRETTOKEN000000000000000"), "概述 token 泄漏:\n{md}");
+        assert!(!md.contains("tester"), "用户目录泄漏:\n{md}");
+        assert!(md.contains("客户端环境") && md.contains("检查项明细"), "报告结构缺失:\n{md}");
     }
 
     // ---- Live 真实环境验证（只读，显式运行） ----

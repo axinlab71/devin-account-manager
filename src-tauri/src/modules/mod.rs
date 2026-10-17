@@ -26,6 +26,8 @@ pub mod rotation_state;
 pub mod switch_adapter;
 pub mod secure_account_storage;
 pub mod windows_operation;
+pub mod client_support;
+pub mod account_export;
 pub mod windsurf_account;
 pub mod windsurf_devin_oauth;
 pub mod windsurf_instance;

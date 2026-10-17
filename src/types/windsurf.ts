@@ -1310,13 +1310,20 @@ export interface ClientDiagnostics {
   cliLogDirExists: boolean;
   ideProcessesRunning: number;
   agentProcessesRunning: number;
+  /** 客户端注册的 reloadAcpConnections 命令存在（仅手动指引可用，无外部调用入口）。 */
+  acpReloadAvailable: boolean;
+  /** 本版客户端是否注册 reconnectAcpConnections（1.126.0 实测不存在）。 */
+  acpReconnectAvailable: boolean;
 }
 
 export interface ProxySection {
   systemProxyEnabled: boolean;
   systemProxyServer: string | null;
   systemProxyListening: boolean | null;
-  pacDetected: boolean;
+  /** 注册表 blob 里存在 PAC URL 字符串（含未启用的无害残留）。 */
+  pacConfigured: boolean;
+  /** 当前代理模式真正启用 PAC（WinInet flags 0x04）；仅 pacActive=true 才是生效中的 PAC。 */
+  pacActive: boolean;
   pacTarget: string | null;
   pacListening: boolean | null;
   envProxies: string[];
@@ -1342,6 +1349,8 @@ export interface NetworkProbeResult {
   tcp: ProbeTiming | null;
   tls: ProbeTiming | null;
   classification: string;
+  /** 探测路径：direct=管理器直连（不代表 Devin 实际路径）/ proxy / unknown */
+  path: string;
   riskNote: string | null;
 }
 
@@ -1361,6 +1370,8 @@ export interface LogDiagnostics {
   runningAgentPids: number[];
   runningAgentsAuthenticated: boolean | null;
   newestLogHasAuthFailure: boolean;
+  /** 近期日志出现的失败类别：network_timeout/auth_failed/permission/config/unknown */
+  failureCategories: string[];
 }
 
 export interface RecommendedFix {
