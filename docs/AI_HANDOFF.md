@@ -24,9 +24,9 @@ Devin Account Manager 是从 [Cockpit Tools](https://github.com/jlcodes99/cockpi
 | 版本 | 0.4.0，发布说明定位 Beta |
 | 技术栈 | Rust 2021、Tauri 2、React 19、TypeScript 5.8、Vite 7 |
 | 本机工具 | Windows、PowerShell、Node v22.19.0、Rust 1.92.0 MSVC；此前构建使用 VS 2022 / WebView2 |
-| 工程目录 | `D:\devin上号器\devin-switcher-public` |
-| 官方客户端 | `E:\Devin\Devin.exe`；交接时文件/产品版本均为 **3.10.67** |
-| 官方静态资料 | `E:\Devin\resources\app\extensions\windsurf\package.json`、`dist/extension.js`、`E:\Devin\resources\app\product.json` |
+| 工程目录 | `<本机项目目录>` |
+| 官方客户端 | `<官方客户端安装目录>\Devin.exe`；交接时文件/产品版本均为 **3.10.67** |
+| 官方静态资料 | `<官方客户端安装目录>\resources\app\extensions\windsurf\package.json`、`dist/extension.js`、`<官方客户端安装目录>\resources\app\product.json` |
 | 产品元数据 | `product.json` 显示 `urlProtocol=devin`、`dataFolderName=.devin`；不等于 Electron 用户数据目录，不能据此迁移 Token |
 | 默认窗口 | 1120×780，最小 720×560；标准/宽窗口最多三列卡片 |
 | 应用 identifier / Rust lib | `local.devin-switcher.desktop` / `devin_switcher_lib`；不要因产品改名擅自修改 |
@@ -238,7 +238,7 @@ GitHub 最终成功运行：<https://github.com/axinlab71/devin-account-manager/
 
 55 项覆盖包括 OAuth state/fragment、不落 pending 的凭据、端点拒绝、DTO 过滤、加密保存/子进程持久化、Cockpit 合成迁移、组织区分、轮换长期凭据更新、锁、WAL 快照、提交后校验失败/模拟启动失败回滚、损坏/跨目录/密钥变化拒绝和清理边界。**不包含新的自动轮换决策测试。**
 
-本机私有证据在 `D:\devin上号器\research`：`security-tests.txt`、`ui-test-output-0.4.0.txt`、`package-verified-output-0.4.0.txt`、`startup-0.4.0.json` 等。不要把整个 research 上传；异机接手可用仓库验证文档和 CI。构建产物在 `D:\devin上号器\release\0.4.0`。
+本机私有证据在 `<本机research目录>`：`security-tests.txt`、`ui-test-output-0.4.0.txt`、`package-verified-output-0.4.0.txt`、`startup-0.4.0.json` 等。不要把整个 research 上传；异机接手可用仓库验证文档和 CI。构建产物在 `<本机release目录>`。
 
 ### 常用复现（业务开发时执行，交接任务不需要重跑）
 
@@ -255,7 +255,7 @@ node scripts/ci-ui.cjs
 npm run tauri -- build --bundles nsis
 ```
 
-本机此前复用的 target：`$env:CARGO_TARGET_DIR='D:\devin上号器\devin-switcher\src-tauri\target'`，只是构建缓存，不是要修改旧项目源码；其他机器无需照搬。默认 UI 使用 Edge，`DEVIN_PLAYWRIGHT_PATH` 可指定本机 Playwright 包，`DEVIN_BROWSER_CHANNEL=chromium` 选 bundled Chromium。CI 工作流在 `.github/workflows/verify.yml`，push 仅 main，另有 PR/手动触发。
+本机此前复用的 target：`$env:CARGO_TARGET_DIR='<本机Rust target目录>'`，只是构建缓存，不是要修改旧项目源码；其他机器无需照搬。默认 UI 使用 Edge，`DEVIN_PLAYWRIGHT_PATH` 可指定本机 Playwright 包，`DEVIN_BROWSER_CHANNEL=chromium` 选 bundled Chromium。CI 工作流在 `.github/workflows/verify.yml`，push 仅 main，另有 PR/手动触发。
 
 ### 未实测清单
 
@@ -281,7 +281,7 @@ npm run tauri -- build --bundles nsis
 
 阅读顺序：本文 → AUTO_SWITCH_PLAN → README/NOTICE → VALIDATION/REAL-ACCOUNT-CHECKLIST → `lib.rs` 命令与 `windsurf_instance.rs` 写入路径 → 额度解析。计划文档中的“拟新增”符号不是现有代码。
 
-未发现仓库根、docs、项目父目录或 `D:\` 的适用 `AGENTS.md`，本次没有新建或覆盖规范。如果之后要增加，只追加最小规则：
+未发现仓库根、docs 或项目父目录中的适用 `AGENTS.md`，本次没有新建或覆盖规范。如果之后要增加，只追加最小规则：
 
 > 任何 AI 接手本项目时，必须先阅读 docs/AI_HANDOFF.md 和 docs/AUTO_SWITCH_PLAN.md；涉及 Devin 官方登录态、认证存储和切号的代码修改，必须优先保证官方客户端能够正常退出并重新网页登录。
 

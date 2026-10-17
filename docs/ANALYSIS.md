@@ -93,7 +93,7 @@ Rust 直接依赖：tauri 2、serde/json、reqwest、tokio、chrono、dirs、rus
 
 ## 本机官方客户端对照结果
 
-通过 Windows 卸载注册表找到 `E:\Devin\Devin.exe`，版本 **3.10.48**。只读检查其 `resources/app/product.json` 和 `resources/app/extensions/windsurf/dist/extension.js`，未修改客户端代码或登录态。
+通过 Windows 卸载注册表找到 `<官方客户端安装目录>\Devin.exe`，版本 **3.10.48**。只读检查其 `resources/app/product.json` 和 `resources/app/extensions/windsurf/dist/extension.js`，未修改客户端代码或登录态。
 
 - product.json 的 urlProtocol 为 `devin`；扩展 publisher/name 为 `codeium` / `windsurf`。
 - 官方 redirectUri getter 使用 `${env.uriScheme}://${publisher}.${name}`，对应 `devin://codeium.windsurf`。

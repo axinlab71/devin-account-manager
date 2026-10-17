@@ -420,7 +420,7 @@ secondary button swap under `native`; 邮箱密码 tab →
 
 ## 2026-10-17 �� Real-client URI delivery diagnosis + rotation dispatch fix
 
-Live-client evidence (Windows, Devin Desktop @ E:\Devin, ext codeium.windsurf 0.2.0):
+Live-client evidence (Windows, Devin Desktop @ <官方客户端安装目录>, ext codeium.windsurf 0.2.0):
 
 - `devin://codeium.windsurf#access_token=<t>` DOES reach the extension
   natively: renderer.log shows `maybeHandleUriWithToken �� handleAuthToken
