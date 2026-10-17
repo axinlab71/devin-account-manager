@@ -6,7 +6,7 @@
 
 [下载发布版本](https://github.com/axinlab71/devin-account-manager/releases) · [反馈问题](https://github.com/axinlab71/devin-account-manager/issues) · [源码仓库](https://github.com/axinlab71/devin-account-manager)
 
-> 非官方项目。当前源码版本为 **0.5.1**，功能与可下载发布版本可能存在差异，请以对应 Release 的说明为准。
+> 非官方项目。当前源码版本为 **0.5.2**，功能与可下载发布版本可能存在差异，请以对应 Release 的说明为准。
 
 ![账号管理界面（合成演示数据）](docs/ui-0.4.0-light.png)
 
