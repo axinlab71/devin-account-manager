@@ -720,6 +720,10 @@ pub struct ConnectionSettingsInfo {
 /// 解析 `HKCU\...\Internet Settings\Connections\DefaultConnectionSettings`
 /// 注册表字节。只提取“是否配置了 PAC + PAC 目标主机:端口”，
 /// PAC URL 的 path/query/secret 绝不进入返回值。
+///
+/// 字节布局（版本 0x3C/0x46）：version(4) counter(4) options(4)
+/// proxyServer(str+null) bypass(str+null) pacUrl(str+null) ...
+/// 注意 PAC URL 在 bypass 之后；旧实现漏掉 bypass，把 bypass 误当 PAC。
 pub fn parse_default_connection_settings(data: &[u8]) -> Option<ConnectionSettingsInfo> {
     if data.len() < 12 {
         return None;
@@ -745,15 +749,23 @@ pub fn parse_default_connection_settings(data: &[u8]) -> Option<ConnectionSettin
         ]) as usize)
     };
 
-    // 静态代理字符串（跳过，不进入结果）
-    let proxy_len = read_len(offset)?;
-    offset += 4;
-    if proxy_len > data.len().saturating_sub(offset) {
-        return None;
-    }
-    offset += proxy_len;
+    // 跳过一根长度前缀的字符串（proxyServer / bypass），内容不进入结果
+    let mut skip_string = |offset: &mut usize| -> Option<()> {
+        let len = read_len(*offset)?;
+        *offset += 4;
+        if len > data.len().saturating_sub(*offset) {
+            return None;
+        }
+        *offset += len;
+        Some(())
+    };
 
-    // PAC URL 字符串：只提取 host:port
+    // 静态代理字符串（跳过，不进入结果）
+    skip_string(&mut offset)?;
+    // bypass 例外列表字符串（跳过，不进入结果）
+    skip_string(&mut offset)?;
+
+    // PAC URL 字符串（在 bypass 之后的尾部区域）：只提取 host:port
     let pac_len = read_len(offset)?;
     offset += 4;
     if pac_len > data.len().saturating_sub(offset) {
@@ -1127,7 +1139,7 @@ fn collect_proxy_info(profile: &Path, network: &[NetworkProbeResult]) -> (ProxyS
         probe.host.ends_with("codeium.com")
             && matches!(
                 probe.classification.as_str(),
-                "tcp_failed" | "tls_failed" | "high_latency" | "unstable"
+                "tcp_failed" | "tls_failed" | "high_latency" | "unstable" | "tail_latency"
             )
     });
     let ineffective_proxy = devin_endpoint.is_none()
@@ -1239,7 +1251,25 @@ fn probe_host(host: &str) -> NetworkProbeResult {
     }
 
     let classification = classify_probe(dns_ok, &tcp_times, tls_attempted, &tls_times);
-    let risk_note = if host.ends_with("codeium.com") && classification != "ok" {
+    let risk_note = if classification == "tail_latency" {
+        let all_max = tcp_times
+            .iter()
+            .chain(tls_times.iter())
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let all_min = tcp_times
+            .iter()
+            .chain(tls_times.iter())
+            .copied()
+            .min()
+            .unwrap_or(0);
+        Some(format!(
+            "检测到高延迟波动（单次连接/握手 max {}ms，波动 {}ms），认证类请求可能超时",
+            all_max,
+            all_max.saturating_sub(all_min)
+        ))
+    } else if host.ends_with("codeium.com") && classification != "ok" {
         Some("本地 agent 认证需要访问 codeium 服务（team settings 拉取 10 秒超时、失败即硬失败），当前网络状况可能导致模型列表为空 / ACP 断连".to_string())
     } else {
         None
@@ -1287,7 +1317,15 @@ fn tls_handshake(_host: &str, _stream: TcpStream) -> Result<(), String> {
 }
 
 /// 判定逻辑（独立函数以便单测）：
-/// dns_failed / tcp_failed / tls_failed / high_latency(max≥5s) / unstable(波动≥3s) / ok
+/// dns_failed / tcp_failed / tls_failed / high_latency(tcp max≥5s) /
+/// unstable(tcp 波动≥3s) / tail_latency(尾部延迟或波动，见下) / ok
+///
+/// 尾部延迟维度：认证类请求（team settings 10 秒超时）对单次高延迟敏感，
+/// TLS 握手时间与 TCP 一起计入——
+/// - 任一样本 max ≥ 5000ms → tail_latency
+/// - max ≥ 3000ms 且 max−min ≥ 3000ms → tail_latency（波动）
+/// - 3000ms ≤ max < 5000ms（无大幅波动）也不允许 ok，保守标 tail_latency
+/// 只有全部成功且 max < 3000ms 才是 ok。
 pub fn classify_probe(
     dns_ok: bool,
     tcp_times_ms: &[u128],
@@ -1310,6 +1348,23 @@ pub fn classify_probe(
     }
     if tcp_times_ms.len() >= 2 && max.saturating_sub(min) >= 3000 {
         return "unstable".to_string();
+    }
+    // 尾部延迟维度（计入 TLS 握手）
+    let all_times: Vec<u128> = tcp_times_ms
+        .iter()
+        .chain(tls_times_ms.iter())
+        .copied()
+        .collect();
+    let all_max = all_times.iter().max().copied().unwrap_or(0);
+    let all_min = all_times.iter().min().copied().unwrap_or(0);
+    if all_max >= 5000 {
+        return "tail_latency".to_string();
+    }
+    if all_max >= 3000 && all_max.saturating_sub(all_min) >= 3000 {
+        return "tail_latency".to_string();
+    }
+    if all_max >= 3000 {
+        return "tail_latency".to_string();
     }
     "ok".to_string()
 }
@@ -1366,6 +1421,20 @@ fn run_network_probes() -> (Vec<NetworkProbeResult>, Vec<DiagnosticItem>) {
                 "unstable" => (
                     CheckStatus::Unknown,
                     format!("{} 延迟波动大，高峰时段可能超时", probe.host),
+                ),
+                "tail_latency" => (
+                    CheckStatus::Unknown,
+                    format!(
+                        "{} 检测到高延迟波动（单次连接/握手 max {}ms），认证类请求可能超时",
+                        probe.host,
+                        probe
+                            .tcp
+                            .iter()
+                            .chain(probe.tls.iter())
+                            .map(|t| t.max_ms)
+                            .max()
+                            .unwrap_or(0)
+                    ),
                 ),
                 _ => (CheckStatus::Unknown, format!("{} 无法判断", probe.host)),
             };
@@ -1727,7 +1796,7 @@ fn build_summary(
         probe.host.ends_with("codeium.com")
             && matches!(
                 probe.classification.as_str(),
-                "dns_failed" | "tcp_failed" | "tls_failed" | "high_latency" | "unstable"
+                "dns_failed" | "tcp_failed" | "tls_failed" | "high_latency" | "unstable" | "tail_latency"
             )
     });
 
@@ -2287,23 +2356,23 @@ mod tests {
 
     // ---- DefaultConnectionSettings 解析（合成字节） ----
 
+    // 合成字节布局与真实注册表一致：proxyServer + bypass + pacUrl
     fn build_default_connection_settings(
         flags: u32,
         proxy_server: Option<&str>,
+        bypass: Option<&str>,
         pac_url: Option<&str>,
     ) -> Vec<u8> {
         let mut data = Vec::new();
         data.extend_from_slice(&0x46u32.to_le_bytes());
         data.extend_from_slice(&1u32.to_le_bytes());
         data.extend_from_slice(&flags.to_le_bytes());
-        let proxy = proxy_server.unwrap_or("").as_bytes().to_vec();
-        data.extend_from_slice(&(proxy.len() as u32 + 1).to_le_bytes());
-        data.extend_from_slice(&proxy);
-        data.push(0);
-        let pac = pac_url.unwrap_or("").as_bytes().to_vec();
-        data.extend_from_slice(&(pac.len() as u32 + 1).to_le_bytes());
-        data.extend_from_slice(&pac);
-        data.push(0);
+        for part in [proxy_server, bypass, pac_url] {
+            let bytes = part.unwrap_or("").as_bytes().to_vec();
+            data.extend_from_slice(&(bytes.len() as u32 + 1).to_le_bytes());
+            data.extend_from_slice(&bytes);
+            data.push(0);
+        }
         data
     }
 
@@ -2312,21 +2381,54 @@ mod tests {
         let bytes = build_default_connection_settings(
             0x02,
             None,
+            Some("<local>"),
             Some("http://127.0.0.1:20084/proxy.pac?secret=topsecretvalue123456&token=abc"),
         );
         let info = parse_default_connection_settings(&bytes).expect("parse");
         assert!(info.pac_detected);
+        // PAC URL 在 bypass 之后的尾部，必须解析出 host:port
         assert_eq!(info.pac_target, Some(("127.0.0.1".to_string(), 20084)));
         assert!(info.pac_hidden_query);
         // secret 绝不进入解析结果
         let debug = format!("{info:?}");
         assert!(!debug.contains("topsecret"), "{debug}");
         assert!(!debug.contains("token=abc"), "{debug}");
+        assert!(!debug.contains("proxy.pac"), "{debug}");
+    }
+
+    #[test]
+    fn parse_connection_settings_no_pac() {
+        // 静态代理 + bypass，无 PAC URL、无 PAC 标志位
+        let bytes = build_default_connection_settings(0x01, Some("127.0.0.1:7897"), Some("<local>"), None);
+        let info = parse_default_connection_settings(&bytes).expect("parse");
+        assert!(!info.pac_detected);
+        assert_eq!(info.pac_target, None);
+    }
+
+    #[test]
+    fn parse_connection_settings_pac_flag_set_but_url_empty() {
+        // 标志位有 PAC 但 URL 为空串：不猜测目标
+        let bytes = build_default_connection_settings(0x02, None, Some("<local>"), None);
+        let info = parse_default_connection_settings(&bytes).expect("parse");
+        assert_eq!(info.pac_target, None);
+    }
+
+    #[test]
+    fn parse_connection_settings_truncated_pac_is_rejected() {
+        let mut truncated = build_default_connection_settings(
+            0x02,
+            Some("127.0.0.1:7897"),
+            Some("<local>"),
+            Some("http://127.0.0.1:20084/proxy.pac?secret=truncatedsecretvalue"),
+        );
+        // 截掉 pacUrl 尾部字节：长度字段指向不存在的字节，必须判为无法解析而非半解析
+        truncated.truncate(truncated.len() - 5);
+        assert!(parse_default_connection_settings(&truncated).is_none());
     }
 
     #[test]
     fn parse_connection_settings_static_proxy_only() {
-        let bytes = build_default_connection_settings(0x01, Some("127.0.0.1:7897"), None);
+        let bytes = build_default_connection_settings(0x01, Some("127.0.0.1:7897"), None, None);
         let info = parse_default_connection_settings(&bytes).expect("parse");
         assert!(!info.pac_detected);
         assert_eq!(info.pac_target, None);
@@ -2336,10 +2438,10 @@ mod tests {
     fn parse_connection_settings_rejects_garbage() {
         assert!(parse_default_connection_settings(&[]).is_none());
         assert!(parse_default_connection_settings(&[0u8; 8]).is_none());
-        let mut bad = build_default_connection_settings(0x02, None, None);
+        let mut bad = build_default_connection_settings(0x02, None, None, None);
         bad[0] = 0xFF; // 未知版本
         assert!(parse_default_connection_settings(&bad).is_none());
-        let mut truncated = build_default_connection_settings(0x02, Some("127.0.0.1:7897"), None);
+        let mut truncated = build_default_connection_settings(0x02, Some("127.0.0.1:7897"), None, None);
         truncated.truncate(14); // 长度字段指向不存在的字节
         assert!(parse_default_connection_settings(&truncated).is_none());
     }
@@ -2356,6 +2458,16 @@ mod tests {
         assert_eq!(classify_probe(true, &[100, 140, 120], true, &[110, 150]), "ok");
         // TLS 未尝试（非 Windows）时不受 TLS 影响
         assert_eq!(classify_probe(true, &[100], false, &[]), "ok");
+        // 全部成功且 max < 3000ms 才允许 ok
+        assert_eq!(classify_probe(true, &[2500, 2800, 2600], true, &[2400, 2900, 2500]), "ok");
+        // 单次 TLS 握手 max ≥ 5000ms（线上认证超时同款特征）→ tail_latency
+        assert_eq!(classify_probe(true, &[300, 400, 350], true, &[280, 330, 12215]), "tail_latency");
+        // max ≥ 3000 且 max−min ≥ 3000（波动）→ tail_latency
+        assert_eq!(classify_probe(true, &[300, 400, 350], true, &[1500, 4800, 2000]), "tail_latency");
+        // 3000 ≤ max < 5000 且无大幅波动：也不允许无条件 ok
+        assert_eq!(classify_probe(true, &[300, 400, 350], true, &[2000, 4500, 2100]), "tail_latency");
+        // TLS 快但 TCP 整体尾巴偏高 → tail_latency
+        assert_eq!(classify_probe(true, &[2800, 3100, 2900], true, &[200, 250, 210]), "tail_latency");
     }
 
     #[test]
@@ -2522,7 +2634,7 @@ mod tests {
             assert_eq!(redact_text(&item.title), item.title, "title 未脱敏: {}", item.title);
             assert_eq!(redact_text(&item.detail), item.detail, "detail 未脱敏: {}", item.detail);
             for ev in &item.evidence {
-                assert_eq!(redact_text(ev), ev, "evidence 未脱敏: {ev}");
+                assert_eq!(redact_text(ev), *ev, "evidence 未脱敏: {ev}");
             }
         }
         // 全量 JSON 再校验一遍（覆盖 items 之外的结构性字段）
